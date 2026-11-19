@@ -1,0 +1,1010 @@
+-- ===================== LIVE PLAYER LOG =====================
+-- Global registry of active UH script users on the Cloudflare LiveLogHub (/live/*) + role-restricted roster + remote moderation commands.
+-- Identity = Roblox profile-code verification done BY THE WORKER (a session token). Every verified script client publishes its own presence
+-- (opt-out switch in SHARE MY PRESENCE); only verified players / co-owners / owner can read the roster, and the Worker re-checks that on every request.
+-- The active-user count comes from the Worker (unique accounts with unexpired presence), never from a client.
+-- Moderation commands arrive on the existing heartbeat response; this client validates every one and acknowledges it on the next presence request.
+-- Everything here is client convenience: hiding UI is not the security boundary, the Worker is.
+local okLPL, errLPL = pcall(function()
+local Player = Players.LocalPlayer
+local TeleportService = cloneref(game:GetService("TeleportService"))
+local MarketplaceService = cloneref(game:GetService("MarketplaceService"))
+local LIVE_BACKEND = nil -- nil = the existing official Worker (Util.Guard.BACKEND). Set "https://<name>.<sub>.workers.dev" only if the repo is deployed as its own Worker.
+local HB_BASE, HB_JITTER = 100, 10 -- presence heartbeat (seconds), jittered. Not changed: the same heartbeat also carries commands + acknowledgements.
+local STALE_AFTER = 150 -- seconds without a heartbeat before an entry is shown as STALE (the Worker removes it at 240s)
+local PAGE_SIZE = 40 -- roster cards drawn at once (search narrows the whole global list; "Show more" draws the next page)
+local FILE = "UhhhhhhReanim/LivePlayerLog.json"
+local GREEN, YELLOW, RED, GRAY = "#6EE7A0", "#FFE066", "#FF8080", "#AAAAAA"
+local FINAL = {EXECUTED = true, REJECTED = true, EXPIRED = true, TARGET_OFFLINE = true, ACTION_UNSUPPORTED = true, FAILED = true}
+local ACTS = {"kick", "kill", "deanimate", "dizzy", "hallucinate", "ban"}
+local LPL = {}
+local Fallback = {}
+local SID = (HttpService:GenerateGUID(false):gsub("-", "")):lower() -- one id per script run (several simultaneous runs of one account are counted once)
+local function SD() if type(SaveData) == "table" then return SaveData end return Fallback end
+local function notify(t) pcall(Util.Notify or Util.UINotify, t) end
+local function esc(s) return (tostring(s):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")) end
+local function commas(n)
+	local s, r = tostring(math.floor(tonumber(n) or 0))
+	repeat s, r = s:gsub("^(-?%d+)(%d%d%d)", "%1,%2") until r == 0
+	return s
+end
+local function fmtAge(a)
+	a = math.max(0, math.floor(a))
+	if a < 5 then return "just now" elseif a < 60 then return a .. "s ago" end
+	return math.floor(a / 60) .. "m ago"
+end
+local function backend() return (tostring(LIVE_BACKEND or (Util.Guard and Util.Guard.BACKEND) or "https://banner-system.elliptmal.workers.dev"):gsub("/+$", "")) end
+local function guardOk() local G = Util.Guard; return G == nil or G.State == "ok" end -- security handshake must have succeeded (fail closed otherwise)
+local function newId() return (HttpService:GenerateGUID(false):gsub("-", "")):lower() end
+
+local Auth = {Token = nil, Challenge = nil, CK = nil, Msg = nil, Busy = false, Views = {}, Loaded = false}
+local Pub = {Gen = 0, Running = false, Status = "off", LastOk = nil, LastFP = nil, InFlight = false, Note = nil, Hook = nil, Acks = {}, Flushing = false, Banned = false}
+local Cmd = {Seen = {}, Order = {}}
+local V = {Gen = 0, IsOpen = false, Looping = false, Busy = false, CmdBusy = false, Cursor = nil, Entries = {}, Cards = {}, Interval = 45, Fails = 0, NextAt = 0, Halt = nil, ErrText = nil, ErrShown = false, LastOk = nil, ClosedAt = 0,
+	Count = 0, Sessions = 0, Cap = 0, Sat = false, Role = nil, Acts = {}, ActSig = "", Cmds = {}, Filter = "", Shown = PAGE_SIZE}
+
+-- one request: returns ok, httpStatus, decodedBody, errText. Never throws; gives up after 15s.
+local function call(method, path, body, withAuth)
+	local rq = request or http_request or (syn and syn.request)
+	if type(rq) ~= "function" then return false, 0, nil, "this executor has no request()" end
+	local headers = {["Content-Type"] = "application/json"}
+	if withAuth then
+		if not Auth.Token then return false, 401, nil, "not verified" end
+		headers["Authorization"] = "Bearer " .. Auth.Token
+	end
+	local payload
+	if body ~= nil then
+		local okE, enc = pcall(HttpService.JSONEncode, HttpService, body)
+		if not okE then return false, 0, nil, "encode failed" end
+		payload = enc
+	end
+	local done, res
+	task.spawn(function()
+		local ok, r = pcall(rq, {Url = backend() .. path, Method = method, Headers = headers, Body = payload})
+		res = ok and r or false
+		done = true
+	end)
+	local t0 = os.clock()
+	while not done and os.clock() - t0 < 15 do task.wait(0.1) end
+	if type(res) ~= "table" then return false, 0, nil, "no response" end
+	local code = tonumber(res.StatusCode) or 0
+	local data
+	if type(res.Body) == "string" and res.Body ~= "" then
+		local okJ, d = pcall(HttpService.JSONDecode, HttpService, res.Body)
+		if okJ and type(d) == "table" then data = d end
+	end
+	return true, code, data
+end
+local function isBanned(ok, code, d) return ok and code == 403 and type(d) == "table" and d.err == "banned" end
+
+local function describe(ok, code, d, err)
+	if not ok then return "Cannot reach the backend (" .. tostring(err or "no response") .. ")." end
+	local e = type(d) == "table" and d.err or nil
+	if e == "code_not_found" then return "The code is not in your Roblox profile About text yet. Save it there, then tap Verify again." end
+	if e == "expired" then return "That code expired. Get a new one." end
+	if e == "forbidden" and code == 403 then return "That code was requested by another session. Get a new code." end
+	if e == "banned" then return "This account is banned from UH script services." end
+	if e == "full" then return "The global registry is at capacity right now." end
+	if e == "roblox_unavailable" then return "The backend could not reach Roblox. Try again shortly." end
+	if e == "roles_unavailable" then return "The role list is temporarily unavailable, so nothing is shown." end
+	if code == 404 then return "The Live Player Log backend is not deployed yet." end
+	if code == 429 then return "Too many requests. Wait a moment." end
+	if code >= 500 then return "The backend is unavailable (HTTP " .. tostring(code) .. ")." end
+	return "Unexpected backend response (HTTP " .. tostring(code) .. (e and (": " .. tostring(e)) or "") .. ")."
+end
+
+-- ---------- verification ----------
+function Auth.Load()
+	if Auth.Token then return true end
+	if Auth.Loaded then return false end
+	Auth.Loaded = true
+	local okF, raw = pcall(function() return type(isfile) == "function" and isfile(FILE) and readfile(FILE) end)
+	if not okF or type(raw) ~= "string" then return false end
+	local okJ, d = pcall(HttpService.JSONDecode, HttpService, raw)
+	if okJ and type(d) == "table" and tonumber(d.uid) == Player.UserId and type(d.token) == "string" and #d.token >= 32 and #d.token <= 128 then
+		Auth.Token = d.token
+		return true
+	end
+	return false
+end
+local function saveToken(tok)
+	local okE, enc = pcall(HttpService.JSONEncode, HttpService, tok and {uid = Player.UserId, token = tok} or {})
+	if not okE then return end
+	local FS = Util.FS
+	if FS and FS.Write then pcall(FS.Write, FILE, enc) elseif type(writefile) == "function" then pcall(writefile, FILE, enc) end
+end
+function Auth.Notify() for _, f in ipairs(Auth.Views) do pcall(f) end end
+function Auth.Forget()
+	Auth.Token, Auth.Challenge = nil, nil
+	Auth.Loaded = true
+	saveToken(nil)
+	Auth.Notify()
+end
+function Auth.Begin(renew)
+	if Auth.Busy or Auth.Token then return end
+	Auth.Busy, Auth.Msg = true, "Requesting a code..."
+	Auth.CK = newId() -- secret of THIS client: the code can only be redeemed by the client that asked for it
+	Auth.Notify()
+	task.spawn(function()
+		local ok, code, d, err = call("POST", "/live/auth/challenge", {userId = Player.UserId, ck = Auth.CK}, false)
+		Auth.Busy = false
+		if ok and code == 200 and type(d) == "table" and d.ok == true and type(d.code) == "string" and type(d.cid) == "string" then
+			Auth.Challenge = {cid = d.cid, code = d.code, exp = os.clock() + (tonumber(d.ttl) or 600)}
+			Auth.Msg = nil
+		else
+			if isBanned(ok, code, d) then LPL.OnBanned() end
+			Auth.Msg = describe(ok, code, d, err)
+		end
+		Auth.Notify()
+	end)
+end
+function Auth.Verify()
+	local ch = Auth.Challenge
+	if Auth.Busy or Auth.Token or not ch or not Auth.CK then return end
+	Auth.Busy, Auth.Msg = true, "Checking your Roblox profile..."
+	Auth.Notify()
+	task.spawn(function()
+		local ok, code, d, err = call("POST", "/live/auth/verify", {cid = ch.cid, ck = Auth.CK}, false)
+		Auth.Busy = false
+		if ok and code == 200 and type(d) == "table" and d.ok == true and type(d.token) == "string" and #d.token >= 32 and #d.token <= 128 then
+			Auth.Token, Auth.Challenge, Auth.Msg = d.token, nil, nil
+			saveToken(d.token)
+			Auth.Notify()
+			LPL.OnVerified()
+			return
+		end
+		if ok and (code == 410 or (code == 403 and type(d) == "table" and d.err == "forbidden")) then Auth.Challenge = nil end
+		if isBanned(ok, code, d) then LPL.OnBanned() end
+		Auth.Msg = describe(ok, code, d, err)
+		Auth.Notify()
+	end)
+end
+function Auth.Logout()
+	if Auth.Busy or not Auth.Token then return end
+	Auth.Busy = true
+	task.spawn(function()
+		Pub.Stop(true)
+		local t0 = os.clock()
+		while (Pub.InFlight or Pub.Leaving) and os.clock() - t0 < 20 do task.wait(0.1) end
+		pcall(call, "POST", "/live/auth/logout", {}, true)
+		Auth.Busy = false
+		Auth.Forget()
+		V.Wipe()
+		notify("Live Player Log: verification removed from this device.")
+	end)
+end
+-- shared verification controls; `want()` decides when the section is shown
+function Auth.Attach(page, want)
+	local info = UI.CreateText(page, "", 11, Enum.TextXAlignment.Left)
+	local getBtn = UI.CreateButton(page, "Get verification code", 18)
+	local copyBtn = UI.CreateButton(page, "Copy code", 18)
+	local verBtn = UI.CreateButton(page, "I added it - Verify", 18)
+	local newBtn = UI.CreateButton(page, "Get a new code", 18)
+	local outBtn = UI.CreateButton(page, "Remove verification from this device", 18)
+	local function show(x, on) local c = x.Parent; if c then c.Visible = on end end
+	local function refresh()
+		local tok, ch = Auth.Token, Auth.Challenge
+		if ch and os.clock() > ch.exp then Auth.Challenge, ch = nil, nil end
+		local on = want() == true
+		local text
+		if tok then text = '<font color="' .. GREEN .. '">This Roblox account is verified on this device.</font>'
+		elseif ch then text = "1) Tap Copy code.\n2) Roblox profile > About > paste the code anywhere in your description > Save.\n3) Come back and tap Verify. You can delete the code afterwards.\n\nCode: <b>" .. esc(ch.code) .. "</b>"
+		else text = "Verification proves this Roblox account is yours, so nobody can appear as you or read the log in your name. One-time step per device.\nOnce verified, this script session is listed in the global registry of active UH script users (username, display name, experience; no IP or device data). You can switch that off in Feature Center > SHARE MY PRESENCE." end
+		if Auth.Msg then text = text .. '\n<font color="' .. YELLOW .. '">' .. esc(Auth.Msg) .. "</font>" end
+		if info.Text ~= text then info.Text = text end
+		show(info, on)
+		show(getBtn, on and not tok and not ch and not Auth.Busy)
+		show(copyBtn, on and not tok and ch ~= nil)
+		show(verBtn, on and not tok and ch ~= nil and not Auth.Busy)
+		show(newBtn, on and not tok and ch ~= nil and not Auth.Busy)
+		show(outBtn, on and tok ~= nil)
+	end
+	getBtn.Activated:Connect(function() Auth.Begin(false) end)
+	newBtn.Activated:Connect(function() Auth.Challenge = nil; Auth.Begin(true) end)
+	verBtn.Activated:Connect(Auth.Verify)
+	outBtn.Activated:Connect(Auth.Logout)
+	copyBtn.Activated:Connect(function()
+		local ch = Auth.Challenge
+		if not ch then return end
+		if type(setclipboard) == "function" then pcall(setclipboard, ch.code); notify("Code copied.") else notify("Code: " .. ch.code) end
+	end)
+	Auth.Views[#Auth.Views + 1] = refresh
+	refresh()
+	return refresh
+end
+
+-- ---------- presence publisher (every verified session registers itself; SHARE MY PRESENCE is the opt-out) ----------
+local placeNames = {}
+local function placeName()
+	local pid = game.PlaceId
+	if placeNames[pid] == nil then
+		local ok, info = pcall(function() return MarketplaceService:GetProductInfo(pid) end)
+		placeNames[pid] = (ok and type(info) == "table" and type(info.Name) == "string" and info.Name ~= "") and info.Name or tostring(game.Name or "")
+	end
+	return placeNames[pid]
+end
+local function setPubStatus(s) Pub.Status = s; if Pub.Hook then pcall(Pub.Hook) end end
+local function consentOn() return SD().LivePresence ~= false end -- ON unless the user switched it off
+-- actions this client can really execute (advertised to the Worker, which refuses anything else as ACTION_UNSUPPORTED)
+local function caps()
+	local t = {"kick"}
+	if type(Util.ModActions) == "table" and type(Util.ModActions.Kill) == "function" then t[#t + 1] = "kill" end
+	if type(Util.ModDeanimate) == "function" then t[#t + 1] = "deanimate" end
+	local F = Util.ModFx
+	if type(F) == "table" and type(F.Run) == "function" then t[#t + 1] = "dizzy"; t[#t + 1] = "hallucinate" end
+	t[#t + 1] = "ban" -- applied by the backend; this client exits when the backend reports the ban
+	return t
+end
+local function beat(gen)
+	local pub = game.PrivateServerId == "" and game.JobId ~= ""
+	local snap = {pid = game.PlaceId, g = placeName():sub(1, 64), j = pub and game.JobId or "", pub = pub, sid = SID, dn = tostring(Player.DisplayName or ""):sub(1, 32), cap = caps()}
+	local fp = snap.pid .. "|" .. snap.g .. "|" .. snap.j .. "|" .. snap.dn
+	local body = (fp == Pub.LastFP) and {t = "hb", sid = SID} or snap
+	local sent = math.min(5, #Pub.Acks)
+	if sent > 0 then
+		body.ack = {}
+		for i = 1, sent do body.ack[i] = Pub.Acks[i] end
+	end
+	Pub.InFlight = true
+	local ok, code, d, err = call("POST", "/live/presence", body, true)
+	Pub.InFlight = false
+	if Pub.Gen ~= gen or not consentOn() then return "stop" end
+	if isBanned(ok, code, d) then LPL.OnBanned() return "stop" end
+	if ok and code == 200 and type(d) == "table" and d.ok == true then
+		Pub.LastFP, Pub.LastOk = fp, os.clock()
+		for _ = 1, sent do table.remove(Pub.Acks, 1) end -- delivered acknowledgements leave the queue
+		setPubStatus("on")
+		if type(d.cmd) == "table" then pcall(Cmd.Receive, d.cmd) end
+		return "ok"
+	end
+	if ok and code == 409 then Pub.LastFP = nil return "resync" end
+	if ok and code == 401 then Auth.Forget(); setPubStatus("expired") return "stop" end
+	if ok and code == 429 then return "slow" end
+	return "fail", describe(ok, code, d, err)
+end
+function Pub.Start()
+	if Pub.Running or Pub.Banned or not consentOn() or not Auth.Token then return end
+	Pub.Running = true
+	Pub.Gen += 1
+	local gen = Pub.Gen
+	setPubStatus("starting")
+	task.spawn(function()
+		local fails = 0
+		while Pub.Gen == gen and consentOn() and Auth.Token do
+			local wait_
+			if not guardOk() then
+				setPubStatus("paused")
+				wait_ = 30
+			else
+				local r, msg = beat(gen)
+				if r == "resync" then r, msg = beat(gen) end
+				if r == "stop" then break end
+				if r == "ok" then fails = 0; wait_ = HB_BASE + math.random(-HB_JITTER, HB_JITTER)
+				elseif r == "slow" then wait_ = HB_BASE
+				else
+					fails += 1
+					wait_ = math.min(600, 60 * 2 ^ math.min(fails, 4)) -- exponential backoff, capped at 10 minutes
+					Pub.ErrText = msg
+					setPubStatus("error")
+				end
+			end
+			task.wait(wait_)
+		end
+		if Pub.Gen == gen then Pub.Running = false end
+	end)
+end
+-- stop sending immediately; when `remove`, also delete this session's entry (after any request already in flight has finished)
+function Pub.Stop(remove)
+	Pub.Gen += 1
+	Pub.Running, Pub.LastFP = false, nil
+	if not remove or not Auth.Token or Pub.Leaving then setPubStatus("off") return end
+	Pub.Leaving = true
+	task.spawn(function()
+		local t0 = os.clock()
+		while Pub.InFlight and os.clock() - t0 < 16 do task.wait(0.1) end
+		local removed = false
+		for attempt = 1, 2 do
+			local ok, code = call("POST", "/live/presence/leave", {sid = SID}, true)
+			if ok and (code == 200 or code == 401 or code == 404) then removed = true break end
+			if attempt == 1 then task.wait(3) end
+		end
+		Pub.Leaving = false
+		Pub.Note = removed and "Your entry was removed." or "The backend could not be reached; your entry expires on its own within 4 minutes."
+		setPubStatus("off")
+	end)
+end
+-- send queued acknowledgements right now (one extra request, only after a moderation command); blocks until it is sent
+function Pub.FlushNow()
+	local t0 = os.clock()
+	while Pub.InFlight and os.clock() - t0 < 16 do task.wait(0.1) end
+	if #Pub.Acks == 0 or not Auth.Token or not consentOn() or Pub.Banned then return end
+	local r = beat(Pub.Gen)
+	if r == "resync" then beat(Pub.Gen) end
+end
+function Pub.Flush()
+	if Pub.Flushing or not Auth.Token then return end
+	Pub.Flushing = true
+	task.spawn(function()
+		for _ = 1, 3 do
+			Pub.FlushNow()
+			if #Pub.Acks == 0 then break end
+			task.wait(2)
+		end
+		Pub.Flushing = false
+	end)
+end
+-- the Worker says this account is banned from UH script/backend services: stop everything and leave (same behaviour as the existing device ban)
+function LPL.OnBanned()
+	if Pub.Banned then return end
+	Pub.Banned = true
+	Pub.Gen += 1
+	Pub.Running = false
+	setPubStatus("banned")
+	notify("Live Player Log: this account is banned from UH script services.")
+	task.delay(1.5, function() pcall(function() Player:Kick("BANNED from UH script services by the owner/co-owner.") end) end)
+end
+function LPL.OnVerified()
+	if consentOn() then Pub.Start() end
+	if V.IsOpen then V.Halt = nil; V.NextAt = 0; V.Kick() end
+end
+
+-- ---------- moderation commands (target side) ----------
+-- Every command is validated here even though the Worker already authorised it: addressed to this account AND this script session, not expired,
+-- not seen before, well-formed, known action only, and the sender's role must be allowed to use it. No code or free-form instruction is ever run.
+local RANKS = {verified = 1, ["co-owner"] = 2, owner = 3}
+local function myRank()
+	local ok, r = pcall(function()
+		local R = Util.Roles
+		local role = R.Of(Player)
+		if role == "owner" then return 3 elseif role == "co-owner" then return 2 end
+		if R.VById[Player.UserId] or R.VByName[tostring(Player.Name):lower()] then return 1 end
+		return 0
+	end)
+	return (ok and tonumber(r)) or 0
+end
+function Cmd.Receive(list)
+	for i, c in ipairs(list) do
+		if i > 5 then break end
+		pcall(Cmd.Handle, c)
+	end
+end
+function Cmd.Handle(c)
+	if type(c) ~= "table" then return end
+	local id = c.id
+	if type(id) ~= "string" or #id ~= 32 or not id:match("^%x+$") then return end -- malformed: nothing to acknowledge
+	local prev = Cmd.Seen[id]
+	if prev ~= nil then -- duplicate delivery: never executed twice; a finished one is simply acknowledged again
+		if prev ~= true then Pub.Acks[#Pub.Acks + 1] = {id = id, st = prev.st, n = prev.n}; Pub.Flush() end
+		return
+	end
+	Cmd.Seen[id] = true
+	Cmd.Order[#Cmd.Order + 1] = id
+	if #Cmd.Order > 64 then Cmd.Seen[table.remove(Cmd.Order, 1)] = nil end
+	local function finish(st, note)
+		Cmd.Seen[id] = {st = st, n = note}
+		Pub.Acks[#Pub.Acks + 1] = {id = id, st = st, n = note}
+	end
+	local function bad(st, note) finish(st, note); Pub.Flush() end
+	local a = type(c.a) == "string" and c.a or ""
+	local who = type(c.mn) == "string" and c.mn:sub(1, 20) or "a moderator"
+	local rank, mu = RANKS[c.mr], tonumber(c.mu)
+	if tonumber(c.tu) ~= Player.UserId or c.ts ~= SID then return bad("REJECTED", "wrong target") end
+	local ttl, iat, exp = tonumber(c.ttl), tonumber(c.iat), tonumber(c.exp)
+	if not (ttl and ttl > 0 and iat and exp and exp > iat) then return bad("REJECTED", "expired or malformed") end
+	if not rank or not mu or mu < 1 or mu == Player.UserId then return bad("REJECTED", "unauthorized sender") end
+	if not (a == "kick" or a == "kill" or a == "deanimate" or a == "dizzy" or a == "hallucinate") then return bad("ACTION_UNSUPPORTED", "unknown action") end
+	if rank <= myRank() then return bad("REJECTED", "target outranks sender") end
+	local have = {}
+	for _, x in ipairs(caps()) do have[x] = true end
+	if not have[a] then return bad("ACTION_UNSUPPORTED", "not available in this client") end
+	local dur = tonumber(c.d)
+	task.spawn(function()
+		local A, F = Util.ModActions, Util.ModFx
+		if a == "kick" then
+			notify("Kicked by moderator " .. who .. " (script misuse)")
+			finish("EXECUTED", "kick issued")
+			Pub.FlushNow() -- the acknowledgement has to leave BEFORE the connection is closed
+			pcall(function() Player:Kick("Kicked by moderator " .. who .. " (script misuse)") end)
+			return
+		elseif a == "kill" then
+			notify(who .. " used Kill on you (script misuse)")
+			local ok = pcall(A.Kill)
+			if ok then finish("EXECUTED", "client-local reset") else finish("FAILED", "kill errored") end
+		elseif a == "deanimate" then
+			notify(who .. " used Deanimate on you (script misuse)")
+			local ok, r = pcall(Util.ModDeanimate)
+			if ok then finish("EXECUTED", r == false and "was not reanimating" or "reanimation stopped") else finish("FAILED", "deanimate errored") end
+		else
+			local ok, r, why = pcall(F.Run, a, who, dur)
+			if ok and r then finish("EXECUTED", "temporary effect") elseif ok then finish("REJECTED", tostring(why or "refused")) else finish("FAILED", "effect errored") end
+		end
+		Pub.Flush()
+	end)
+end
+
+-- ---------- viewer ----------
+function LPL.CanView(refresh) return Util.Roles.CanUseLivePlayerLog(Player, refresh) == true end
+function V.Wipe()
+	V.Entries, V.Cursor, V.Count, V.Sessions, V.Sat, V.LastOk, V.Acts, V.ActSig, V.Role, V.Cmds = {}, nil, 0, 0, false, nil, {}, "", nil, {}
+	for id, c in pairs(V.Cards) do pcall(function() c.frame:Destroy() end); V.Cards[id] = nil end
+end
+local function newLabel(parent, size, order)
+	local l = Util.Instance("TextLabel", parent)
+	l.BackgroundTransparency = 1
+	l.RichText = true
+	l.Font = Enum.Font.Code
+	l.TextSize = size
+	l.TextColor3 = Color3.new(1, 1, 1)
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.TextYAlignment = Enum.TextYAlignment.Top
+	l.TextWrapped = true
+	l.Size = UDim2.new(1, 0, 0, 0)
+	l.AutomaticSize = Enum.AutomaticSize.Y
+	l.LayoutOrder = order
+	return l
+end
+local function newButton(parent, text, order, color)
+	local b = Util.Instance("TextButton", parent)
+	b.AutoButtonColor = true
+	b.BackgroundColor3 = color or Color3.fromRGB(52, 56, 74)
+	b.BorderSizePixel = 0
+	b.Size = UDim2.new(1 / 3, -3, 1, 0)
+	b.Font = Enum.Font.Code
+	b.TextSize = 12
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.Text = text
+	b.LayoutOrder = order
+	Util.Instance("UICorner", b).CornerRadius = UDim.new(0, 5)
+	return b
+end
+local function newRow(parent, order)
+	local r = Util.Instance("Frame", parent)
+	r.BackgroundTransparency = 1
+	r.Size = UDim2.new(1, 0, 0, 30)
+	r.LayoutOrder = order
+	local rl = Util.Instance("UIListLayout", r)
+	rl.FillDirection = Enum.FillDirection.Horizontal
+	rl.Padding = UDim.new(0, 4)
+	rl.SortOrder = Enum.SortOrder.LayoutOrder
+	return r
+end
+local joinedAt = 0
+local function joinEntry(e)
+	if e.j == "" or e.p <= 0 then return end
+	if e.j == game.JobId then notify("You are already in that server.") return end
+	if os.clock() - joinedAt < 20 then notify("A join is already in progress.") return end
+	joinedAt = os.clock()
+	local TA = Util.TeleportAutoExec
+	if TA and TA.Arm then pcall(TA.Arm) end
+	local conn
+	local function undo(msg)
+		joinedAt = 0
+		if conn then pcall(function() conn:Disconnect() end); conn = nil end
+		if TA and TA.Abort then pcall(TA.Abort) end
+		if msg then notify(msg) end
+	end
+	local okC, c = pcall(function()
+		return TeleportService.TeleportInitFailed:Connect(function(plr, result, msg)
+			if plr == Player then undo(("Could not join [%s]: %s"):format(tostring(result), tostring(msg))) end
+		end)
+	end)
+	if okC then conn = c end
+	task.delay(25, function() if conn then pcall(function() conn:Disconnect() end); conn = nil end end)
+	local ok, err = pcall(function() TeleportService:TeleportToPlaceInstance(e.p, e.j, Player) end)
+	if not ok then undo("Joining is not available here (" .. tostring(err) .. "). Use COPY IDs instead.") end
+end
+local function copyText(txt, what)
+	if type(setclipboard) == "function" then pcall(setclipboard, txt); notify((what or "Copied") .. ".") else notify((txt:gsub("\n", "  "))) end
+end
+local function copyIds(e)
+	copyText("UserId: " .. e.id .. "\nPlaceId: " .. e.p .. (e.j ~= "" and ("\nJobId: " .. e.j) or ""), "Copied")
+end
+local function profileUrl(e) return "https://www.roblox.com/users/" .. e.id .. "/profile" end
+
+-- one moderation command from this moderator (the Worker authorises it again from the verified session; nothing here is trusted)
+function V.SendCommand(e, act)
+	if V.CmdBusy or not Auth.Token then return end
+	V.CmdBusy = true
+	task.spawn(function()
+		local ok, code, d, err = call("POST", "/live/mod/command", {tu = e.id, a = act}, true)
+		V.CmdBusy = false
+		local label = act:upper() .. " on " .. e.n
+		if ok and code == 200 and type(d) == "table" and d.ok == true and type(d.id) == "string" then
+			local st = tostring(d.st)
+			V.Cmds[d.id] = {st = st, a = act, tn = e.n, note = tostring(d.note or ""), t = os.clock(), noted = FINAL[st] == true}
+			notify(label .. ": " .. st .. (st == "PENDING" and " (waiting for the target's next heartbeat)" or ""))
+			V.Interval, V.NextAt = 20, os.clock() + 20
+		elseif isBanned(ok, code, d) then LPL.OnBanned()
+		elseif ok and code == 401 then Auth.Forget(); V.Halt = "auth"
+		elseif ok and type(d) == "table" then
+			if d.msg then notify(label .. ": " .. tostring(d.msg))
+			else notify(label .. ": " .. tostring(d.st or d.err or ("HTTP " .. code))) end
+		else
+			notify(label .. ": " .. describe(ok, code, d, err))
+		end
+		V.Render()
+	end)
+end
+
+local function modButton(c, parent, act, order)
+	local b = newButton(parent, act:upper(), order, act == "ban" and Color3.fromRGB(122, 40, 44) or nil)
+	local armed = 0
+	b.Activated:Connect(function()
+		local e = c.e
+		if not e then return end
+		if act == "ban" then -- two taps: BAN removes the account from every UH backend service
+			if os.clock() - armed > 4 then
+				armed = os.clock()
+				b.Text = "CONFIRM?"
+				task.delay(4, function() if b.Parent and b.Text == "CONFIRM?" then b.Text = "BAN" end end)
+				return
+			end
+			armed = 0
+			b.Text = "BAN"
+		end
+		V.SendCommand(e, act)
+	end)
+	return b
+end
+local function headLabel(parent, size, y)
+	local l = Util.Instance("TextLabel", parent)
+	l.BackgroundTransparency = 1
+	l.RichText = true
+	l.Font = Enum.Font.Code
+	l.TextSize = size
+	l.TextColor3 = Color3.new(1, 1, 1)
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.TextTruncate = Enum.TextTruncate.AtEnd
+	l.TextWrapped = false
+	l.Position = UDim2.new(0, 48, 0, y)
+	l.Size = UDim2.new(1, -48, 0, 20)
+	return l
+end
+local function makeCard(list)
+	local c = {open = false}
+	local f = Util.Instance("Frame", list)
+	f.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+	f.BackgroundTransparency = 0.12
+	f.BorderSizePixel = 0
+	f.Size = UDim2.new(1, -10, 0, 0)
+	f.AutomaticSize = Enum.AutomaticSize.Y
+	Util.Instance("UICorner", f).CornerRadius = UDim.new(0, 6)
+	local pad = Util.Instance("UIPadding", f)
+	pad.PaddingTop, pad.PaddingBottom = UDim.new(0, 6), UDim.new(0, 6)
+	pad.PaddingLeft, pad.PaddingRight = UDim.new(0, 8), UDim.new(0, 8)
+	local lay = Util.Instance("UIListLayout", f)
+	lay.Padding = UDim.new(0, 5)
+	lay.SortOrder = Enum.SortOrder.LayoutOrder
+	c.frame = f
+	local head = Util.Instance("TextButton", f) -- tap the header to open / close the profile + actions
+	head.BackgroundTransparency = 1
+	head.AutoButtonColor = false
+	head.Text = ""
+	head.Size = UDim2.new(1, 0, 0, 42)
+	head.LayoutOrder = 1
+	local av = Util.Instance("ImageLabel", head)
+	av.BackgroundColor3 = Color3.fromRGB(34, 36, 46)
+	av.BorderSizePixel = 0
+	av.Size = UDim2.new(0, 40, 0, 40)
+	Util.Instance("UICorner", av).CornerRadius = UDim.new(0, 6)
+	c.avatar = av
+	c.title = headLabel(head, 14, 0)
+	c.sub = headLabel(head, 11, 21)
+	local more = Util.Instance("Frame", f)
+	more.BackgroundTransparency = 1
+	more.Size = UDim2.new(1, 0, 0, 0)
+	more.AutomaticSize = Enum.AutomaticSize.Y
+	more.LayoutOrder = 2
+	more.Visible = false
+	local ml = Util.Instance("UIListLayout", more)
+	ml.Padding = UDim.new(0, 5)
+	ml.SortOrder = Enum.SortOrder.LayoutOrder
+	c.more = more
+	c.info = newLabel(more, 12, 1)
+	c.rowA, c.rowB, c.rowC = newRow(more, 2), newRow(more, 3), newRow(more, 4)
+	c.join = newButton(c.rowA, "JOIN", 1)
+	c.copy = newButton(c.rowA, "COPY IDs", 2)
+	c.prof = newButton(c.rowA, "PROFILE", 3)
+	c.acts = {}
+	for i, a in ipairs(ACTS) do c.acts[a] = modButton(c, i <= 3 and c.rowB or c.rowC, a, i) end
+	c.join.Activated:Connect(function() if c.e then joinEntry(c.e) end end)
+	c.copy.Activated:Connect(function() if c.e then copyIds(c.e) end end)
+	c.prof.Activated:Connect(function() if c.e then copyText(profileUrl(c.e), "Profile link copied") end end)
+	head.Activated:Connect(function()
+		c.open = not c.open
+		more.Visible = c.open
+		c.sig = nil
+		V.Render()
+	end)
+	return c
+end
+local function paintCard(c, e, now)
+	local age = now - e.seen
+	local stale = age > STALE_AFTER
+	local canJoin = e.j ~= "" and e.p > 0
+	local me = e.id == Player.UserId
+	local sig = table.concat({e.n, e.d, e.g, e.p, e.j, e.ns, stale and 1 or 0, math.floor(age / 10), c.open and 1 or 0, V.ActSig, me and 1 or 0}, "|")
+	if c.sig == sig then return end
+	c.sig = sig
+	local img = "rbxthumb://type=AvatarHeadShot&id=" .. e.id .. "&w=48&h=48" -- resolved by the Roblox engine and cached by it: no request of ours
+	if c.avatar.Image ~= img then c.avatar.Image = img end
+	local status = stale and ('<font color="' .. YELLOW .. '">STALE</font>') or ('<font color="' .. GREEN .. '">ACTIVE</font>')
+	c.title.Text = "<b>" .. esc(e.n) .. "</b>" .. ((e.d ~= "" and e.d ~= e.n) and (' <font color="' .. GRAY .. '">' .. esc(e.d) .. "</font>") or "") .. "  " .. status .. (e.ns > 1 and (" x" .. e.ns) or "")
+	c.sub.Text = '<font color="' .. GRAY .. '">' .. (e.g ~= "" and esc(e.g) or "unknown experience") .. " - " .. fmtAge(age) .. "</font>"
+	if not c.open then return end
+	c.info.Text = '<font color="' .. GRAY .. '">Username</font> ' .. esc(e.n)
+		.. '\n<font color="' .. GRAY .. '">Display</font> ' .. esc(e.d ~= "" and e.d or e.n)
+		.. '\n<font color="' .. GRAY .. '">UserId</font> ' .. e.id
+		.. '\n<font color="' .. GRAY .. '">Profile</font> roblox.com/users/' .. e.id .. "/profile"
+		.. '\n<font color="' .. GRAY .. '">Game</font> ' .. (e.g ~= "" and esc(e.g) or "unknown experience")
+		.. '\n<font color="' .. GRAY .. '">PlaceId</font> ' .. e.p
+		.. '\n<font color="' .. GRAY .. '">Server</font> ' .. (canJoin and (esc(e.j:sub(1, 8)) .. "...") or "not shared / private")
+		.. '\n<font color="' .. GRAY .. '">Sessions</font> ' .. e.ns .. '\n<font color="' .. GRAY .. '">Last seen</font> ' .. fmtAge(age)
+	c.join.Visible = canJoin and not me
+	local any = {}
+	for _, a in ipairs(ACTS) do
+		local on = V.Acts[a] == true and not me
+		c.acts[a].Visible = on
+		any[a] = on
+	end
+	c.rowB.Visible = any.kick or any.kill or any.deanimate
+	c.rowC.Visible = any.dizzy or any.hallucinate or any.ban
+end
+local function overviewText(now)
+	local cnt = V.LastOk and (commas(V.Count) .. (V.Sat and "+" or "")) or "-"
+	local reg
+	if V.Halt then reg = '<font color="' .. GRAY .. '">PAUSED</font>'
+	elseif V.ErrText then reg = '<font color="' .. RED .. '">OFFLINE (retrying)</font>'
+	elseif V.Sat then reg = '<font color="' .. YELLOW .. '">SATURATED - capacity ' .. commas(V.Cap) .. " reached, the total is a lower bound</font>"
+	elseif V.LastOk then reg = '<font color="' .. GREEN .. '">LIVE</font>'
+	else reg = "loading..." end
+	return "<b>GLOBAL SCRIPT USAGE</b>\nACTIVE SCRIPT USERS: <b>" .. cnt .. "</b>"
+		.. '\n<font color="' .. GRAY .. '">Active sessions: ' .. (V.LastOk and commas(V.Sessions) or "-")
+		.. "\nLast registry update: " .. (V.LastOk and fmtAge(now - V.LastOk) or "-")
+		.. "\nUnique accounts with presence refreshed in the last 4 minutes, all servers and experiences.</font>\nRegistry: " .. reg
+end
+local function statusLine()
+	if V.Halt == "auth" then return '<font color="' .. YELLOW .. '">Verify your Roblox account below to load the list.</font>' end
+	if V.Halt == "denied" then return '<font color="' .. RED .. '">The server did not authorize this account for the Live Player Log.</font>' end
+	if V.Halt == "gate" then return '<font color="' .. RED .. '">Only verified players, co-owners and the owner can use the Live Player Log.</font>' end
+	if V.ErrText then return '<font color="' .. RED .. '">' .. esc(V.ErrText) .. "</font>" end
+	return ""
+end
+local function cmdLines()
+	local arr = {}
+	for id, x in pairs(V.Cmds) do arr[#arr + 1] = x end
+	table.sort(arr, function(a, b) return a.t > b.t end)
+	local out = {}
+	for i = 1, math.min(5, #arr) do
+		local x = arr[i]
+		local col = x.st == "EXECUTED" and GREEN or ((x.st == "PENDING" or x.st == "DELIVERED") and YELLOW or RED)
+		out[#out + 1] = "<b>" .. esc(x.a:upper()) .. "</b> " .. esc(x.tn) .. ': <font color="' .. col .. '">' .. esc(x.st) .. "</font>" .. (x.note ~= "" and (' <font color="' .. GRAY .. '">' .. esc(x.note) .. "</font>") or "")
+	end
+	return table.concat(out, "\n")
+end
+function V.Render()
+	if not V.IsOpen or not V.list then return end
+	local now = os.clock()
+	local q = V.Filter
+	local arr = {}
+	for id, e in pairs(V.Entries) do
+		if q == "" or e.n:lower():find(q, 1, true) or e.d:lower():find(q, 1, true) or e.g:lower():find(q, 1, true) or tostring(id):find(q, 1, true) then arr[#arr + 1] = e end
+	end
+	table.sort(arr, function(a, b) local x, y = a.n:lower(), b.n:lower(); if x ~= y then return x < y end return a.id < b.id end)
+	local shown = {}
+	for rank = 1, math.min(#arr, V.Shown) do
+		local e = arr[rank]
+		shown[e.id] = true
+		local c = V.Cards[e.id]
+		if not c then c = makeCard(V.list); V.Cards[e.id] = c end
+		c.e = e
+		if c.frame.LayoutOrder ~= rank then c.frame.LayoutOrder = rank end
+		paintCard(c, e, now)
+	end
+	for id, c in pairs(V.Cards) do
+		if not shown[id] then pcall(function() c.frame:Destroy() end); V.Cards[id] = nil end
+	end
+	local nTotal = 0
+	for _ in pairs(V.Entries) do nTotal += 1 end
+	if V.empty then V.empty.Parent.Visible = (#arr == 0 and V.Halt == nil and V.LastOk ~= nil) end
+	if V.empty then
+		local t = (nTotal > 0 and q ~= "") and '<font color="' .. GRAY .. '">No active script user matches your search.</font>' or '<font color="' .. GRAY .. '">No other script users are registered right now.</font>'
+		if V.empty.Text ~= t then V.empty.Text = t end
+	end
+	if V.list.Parent then V.list.Parent.Visible = #arr > 0 end
+	if V.moreBtn then
+		V.moreBtn.Parent.Visible = #arr > V.Shown
+		local t = "Show more (" .. (#arr - V.Shown) .. " left)"
+		if V.moreBtn.Text ~= t then V.moreBtn.Text = t end
+	end
+	local ov = overviewText(now)
+	if V.overview and V.overview.Text ~= ov then V.overview.Text = ov end
+	local st = statusLine()
+	if V.status and V.status.Text ~= st then V.status.Text = st end
+	if V.cmdText then
+		local t = cmdLines()
+		if V.cmdText.Text ~= t then V.cmdText.Text = t end
+		V.cmdText.Parent.Visible = t ~= ""
+	end
+	if V.unban then
+		local on = V.Acts.ban == true
+		V.unban.box.Parent.Parent.Visible = on
+		V.unban.btn.Parent.Visible = on
+	end
+end
+local function applyMeta(d)
+	if tonumber(d.onlineCount) then V.Count = math.max(0, math.floor(d.onlineCount)) end -- unique accounts, counted by the Worker
+	if tonumber(d.sessionCount) then V.Sessions = math.max(0, math.floor(d.sessionCount)) end
+	if tonumber(d.cap) then V.Cap = math.floor(d.cap) end
+	V.Sat = d.sat == 1
+	if type(d.role) == "string" then V.Role = d.role end
+	if type(d.acts) == "table" then
+		V.Acts = {}
+		local names = {}
+		for _, a in ipairs(d.acts) do if type(a) == "string" then V.Acts[a] = true; names[#names + 1] = a end end
+		table.sort(names)
+		V.ActSig = table.concat(names, ",")
+	end
+	if type(d.mc) == "table" then
+		for _, m in ipairs(d.mc) do
+			if type(m) == "table" and type(m[1]) == "string" then
+				local st = tostring(m[2])
+				local x = V.Cmds[m[1]]
+				local isNew = x == nil
+				if isNew then x = {t = os.clock()}; V.Cmds[m[1]] = x end
+				x.st, x.a, x.tn, x.note = st, tostring(m[3]), tostring(m[4]), tostring(m[5] or "")
+				if isNew then x.noted = FINAL[st] == true
+				elseif FINAL[st] and not x.noted then
+					x.noted = true
+					notify(x.a:upper() .. " on " .. x.tn .. ": " .. st .. (x.note ~= "" and (" (" .. x.note .. ")") or ""))
+				end
+			end
+		end
+	end
+end
+function V.OpenCmds()
+	local now = os.clock()
+	for _, x in pairs(V.Cmds) do if not FINAL[x.st] and now - x.t < 330 then return true end end
+	return false
+end
+-- returns changed (visible content), needFull (a heartbeat for an entry we never received)
+function V.Apply(d)
+	local now = os.clock()
+	local changed, needFull = false, false
+	if d.full == true then V.Entries = {}; changed = true end
+	for _, id in ipairs(type(d.rm) == "table" and d.rm or {}) do
+		id = math.floor(tonumber(id) or 0)
+		if V.Entries[id] then V.Entries[id] = nil; changed = true end
+	end
+	for _, u in ipairs(type(d.up) == "table" and d.up or {}) do
+		local id = type(u) == "table" and math.floor(tonumber(u.u) or 0) or 0
+		if id > 0 and type(u.n) == "string" then
+			local j = type(u.j) == "string" and #u.j == 36 and u.j:match("^[%x%-]+$") and u.j or ""
+			V.Entries[id] = {id = id, n = u.n:sub(1, 20), d = type(u.d) == "string" and u.d:sub(1, 32) or "", p = math.max(0, math.floor(tonumber(u.p) or 0)), g = type(u.g) == "string" and u.g:sub(1, 64) or "", j = j,
+				ns = math.max(1, math.floor(tonumber(u.ns) or 1)), seen = now - (tonumber(u.a) or 0)}
+			changed = true
+		end
+	end
+	for _, t in ipairs(type(d.tc) == "table" and d.tc or {}) do
+		local id = type(t) == "table" and math.floor(tonumber(t[1]) or 0) or 0
+		local e = V.Entries[id]
+		if e then e.seen = now - (tonumber(t[2]) or 0) elseif id > 0 then needFull = true end
+	end
+	return changed, needFull
+end
+function V.Poll()
+	if V.Busy then return end
+	if not LPL.CanView() then V.Wipe(); V.Halt = "gate" return end -- permission lost: drop everything cached
+	if not guardOk() then V.ErrText = "Security connection unavailable - paused."; V.NextAt = os.clock() + 30 return end
+	if not Auth.Token and not Auth.Load() then V.Wipe(); V.Halt = "auth"; Auth.Notify() return end
+	V.Busy = true
+	local ok, code, d, err = call("GET", "/live/list" .. (V.Cursor and ("?c=" .. V.Cursor) or ""), nil, true)
+	V.Busy = false
+	if not V.IsOpen then return end -- page closed while waiting: discard
+	local now = os.clock()
+	if ok and code == 200 and type(d) == "table" and d.ok == true and type(d.e) == "string" and tonumber(d.s) then
+		local before = V.Count
+		applyMeta(d) -- onlineCount comes with every answer, also the "nothing changed" ones
+		local changed, needFull = false, false
+		if d.nc ~= 1 then changed, needFull = V.Apply(d) end
+		if V.Count ~= before then changed = true end
+		V.Cursor = (not needFull) and (d.e .. "." .. tostring(math.floor(d.s))) or nil
+		V.Fails, V.ErrText, V.ErrShown, V.LastOk, V.Halt = 0, nil, false, now, nil
+		V.Interval = (changed or needFull) and 30 or math.min(90, V.Interval + 15)
+		if V.OpenCmds() then V.Interval = math.min(V.Interval, 20) end -- a command of mine is still in flight: look for its status a little sooner
+		V.NextAt = now + (needFull and 2 or V.Interval)
+		return
+	end
+	if ok and code == 304 then -- unchanged cursor: the roster AND the count we already hold are still correct
+		V.Fails, V.ErrText, V.ErrShown, V.LastOk = 0, nil, false, now
+		V.Interval = math.min(90, V.Interval + 15)
+		if V.OpenCmds() then V.Interval = math.min(V.Interval, 20) end
+		V.NextAt = now + V.Interval
+		return
+	end
+	if isBanned(ok, code, d) then LPL.OnBanned() return end
+	if ok and code == 401 then V.Wipe(); V.Halt = "auth"; Auth.Forget() return end -- token expired / revoked (Forget refreshes the verification controls)
+	if ok and code == 403 then V.Wipe(); V.Halt = "denied" return end -- the server says no: nothing stays cached
+	V.Fails += 1
+	local wait_ = math.min(300, 30 * 2 ^ math.min(V.Fails, 4))
+	V.NextAt = now + wait_
+	V.ErrText = describe(ok, code, d, err) .. " Retrying in " .. math.floor(wait_) .. "s."
+	if not V.ErrShown then V.ErrShown = true; notify("Live Player Log: connection problem. Retrying quietly in the background.") end
+end
+function V.Kick()
+	if not V.IsOpen or V.Looping then return end
+	V.Looping = true
+	V.Gen += 1
+	local gen = V.Gen
+	task.spawn(function()
+		while V.Gen == gen and V.IsOpen do
+			if not V.Halt and os.clock() >= V.NextAt then V.Poll() end
+			if V.Gen ~= gen then break end
+			V.Render()
+			if V.Halt then break end -- authorization problem: stop polling until the user retries / verifies
+			task.wait(10)
+		end
+		if V.Gen == gen then V.Looping = false end
+	end)
+end
+function V.Open()
+	if not LPL.CanView(true) then V.Wipe(); V.Halt = "gate"; return false end
+	V.IsOpen, V.Looping, V.Halt = true, false, nil
+	if os.clock() - V.ClosedAt > 600 then V.Cursor = nil; V.Entries = {} end -- closed for a long time: take a fresh snapshot
+	V.Interval, V.NextAt, V.Fails, V.Shown = 30, 0, 0, PAGE_SIZE
+	V.Render()
+	V.Kick()
+	return true
+end
+function V.Close()
+	V.IsOpen, V.Looping = false, false
+	V.Gen += 1
+	V.ClosedAt = os.clock()
+end
+
+function LPL.AttachViewer(page, closeFn)
+	local C, L = Enum.TextXAlignment.Center, Enum.TextXAlignment.Left
+	UI.CreateButton(page, "&lt; Back", 20).Activated:Connect(closeFn)
+	UI.CreateText(page, "<b>LIVE PLAYER LOG</b>", 15, C)
+	UI.CreateText(page, '<font color="' .. GRAY .. '">Every authenticated UH script user, in every server and experience. Visible to verified players, co-owners and the owner only.</font>', 10, C)
+	V.overview = UI.CreateText(page, "", 12, L)
+	V.status = UI.CreateText(page, "", 11, L)
+	local refreshBtn = UI.CreateButton(page, "Refresh now", 18)
+	Auth.Attach(page, function() return V.Halt == "auth" or Auth.Token == nil end)
+	UI.CreateSeparator(page)
+	local search = UI.CreateTextbox(page, "", "Search username, display name, UserId or game", 12)
+	search:GetPropertyChangedSignal("Text"):Connect(function()
+		V.Filter = (search.Text:lower():gsub("^%s+", ""):gsub("%s+$", ""))
+		V.Shown = PAGE_SIZE
+		V.Render()
+	end)
+	V.cmdText = UI.CreateText(page, "", 11, L)
+	V.cmdText.Parent.Visible = false
+	V.empty = UI.CreateText(page, "", 12, C)
+	V.empty.Parent.Visible = false
+	V.list = UI.CreateCanvas(page)
+	local ll = V.list:FindFirstChildOfClass("UIListLayout")
+	if ll then ll.Padding = UDim.new(0, 6) end
+	V.list.Parent.Visible = false
+	V.moreBtn = UI.CreateButton(page, "Show more", 18)
+	V.moreBtn.Parent.Visible = false
+	V.moreBtn.Activated:Connect(function() V.Shown += PAGE_SIZE; V.Render() end)
+	UI.CreateSeparator(page)
+	local histBtn = UI.CreateButton(page, "Moderation history", 18)
+	V.hist = UI.CreateText(page, "", 11, L)
+	V.hist.Parent.Visible = false
+	local ubBox = UI.CreateTextbox(page, "", "UserId to UNBAN from UH services (owner / co-owner)", 11)
+	local ubBtn = UI.CreateButton(page, "Remove UH services ban", 18)
+	V.unban = {box = ubBox, btn = ubBtn}
+	ubBox.Parent.Parent.Visible = false
+	ubBtn.Parent.Visible = false
+	local lastManual = 0
+	refreshBtn.Activated:Connect(function()
+		if os.clock() - lastManual < 8 or V.Busy then return end -- coalesce rapid taps
+		lastManual = os.clock()
+		if not LPL.CanView() then V.Wipe(); V.Halt = "gate"; V.Render() return end
+		V.Halt = nil
+		V.NextAt = 0
+		if V.IsOpen then if V.Looping then task.spawn(function() V.Poll(); V.Render() end) else V.Kick() end end
+	end)
+	histBtn.Activated:Connect(function()
+		if V.HistBusy or not Auth.Token then return end
+		V.HistBusy = true
+		task.spawn(function()
+			local ok, code, d, err = call("GET", "/live/mod/history", nil, true)
+			V.HistBusy = false
+			if ok and code == 200 and type(d) == "table" and type(d.h) == "table" then
+				local lines = {}
+				for _, h in ipairs(d.h) do
+					if type(h) == "table" then
+						lines[#lines + 1] = os.date("!%m-%d %H:%M", math.floor((tonumber(h.iat) or 0) / 1000)) .. " <b>" .. esc(tostring(h.a or "?"):upper()) .. "</b> " .. esc(tostring(h.mn or "?")) .. " (" .. esc(tostring(h.mr or "?")) .. ") > " .. esc(tostring(h.tn or h.tu or "?"))
+							.. ' <font color="' .. GRAY .. '">' .. esc(tostring(h.st or "?")) .. (h.note and (" - " .. esc(tostring(h.note))) or "") .. "</font>"
+					end
+				end
+				V.hist.Text = #lines > 0 and table.concat(lines, "\n") or "No moderation events recorded."
+				V.hist.Parent.Visible = true
+			else
+				notify("Moderation history: " .. describe(ok, code, d, err))
+			end
+		end)
+	end)
+	ubBtn.Activated:Connect(function()
+		local uid = tonumber(ubBox.Text)
+		if not uid or uid < 1 then notify("Enter the UserId to unban.") return end
+		if V.CmdBusy or not Auth.Token then return end
+		V.CmdBusy = true
+		task.spawn(function()
+			local ok, code, d, err = call("POST", "/live/mod/command", {tu = math.floor(uid), a = "unban"}, true)
+			V.CmdBusy = false
+			if ok and code == 200 and type(d) == "table" and d.ok == true then
+				notify("UNBAN: " .. tostring(d.st) .. " (" .. tostring(d.note or "") .. ")")
+				ubBox.Text = ""
+			elseif ok and type(d) == "table" then notify("UNBAN: " .. tostring(d.st or d.err or ("HTTP " .. code)))
+			else notify("UNBAN: " .. describe(ok, code, d, err)) end
+		end)
+	end)
+	Auth.Views[#Auth.Views + 1] = function() if V.IsOpen and V.Halt == "auth" and Auth.Token then V.Halt = nil; V.NextAt = 0; V.Kick() end end
+	page:GetPropertyChangedSignal("Visible"):Connect(function()
+		if page.Visible then
+			if not V.Open() then V.Render(); pcall(closeFn) end
+		else
+			V.Close()
+		end
+	end)
+end
+
+-- ---------- "Share My Presence" page (available to everyone; ON by default once the account is verified, this is the opt-out) ----------
+local EXPLAIN = "Once your Roblox account is verified, this script session is listed in the <b>global registry of active UH script users</b> and counted in the active-user total. Verified players, co-owners and the owner can see, in the Live Player Log: your <b>Roblox username, display name and UserId</b>, the <b>experience</b> you are in (name + PlaceId) and the <b>public server ID</b> of that server (they can join it). Authorized moderators can also send your script a moderation action (kick, kill, deanimate, dizzy, hallucinate) and the owner / co-owner can ban you from UH script services.\nNothing is sent until you verify. Switching this OFF removes your entry right away and nothing is sent. No IP address, device ID or other personal data is collected. Private server IDs are never shared."
+function LPL.AttachShare(page, closeFn)
+	local C, L = Enum.TextXAlignment.Center, Enum.TextXAlignment.Left
+	UI.CreateButton(page, "&lt; Back", 20).Activated:Connect(closeFn)
+	UI.CreateText(page, "<b>SHARE MY PRESENCE</b>", 15, C)
+	UI.CreateText(page, '<font color="' .. GRAY .. '">Global active-user registry. ON by default after verification; switch OFF to opt out.</font>', 10, C)
+	UI.CreateSeparator(page)
+	UI.CreateText(page, EXPLAIN, 12, L)
+	local status = UI.CreateText(page, "", 12, L)
+	local lever = UI.CreateSwitch(page, "Share My Presence", consentOn())
+	local function statusText()
+		if Pub.Banned then return '<font color="' .. RED .. '">This account is banned from UH script services.</font>' end
+		if not consentOn() then return "Sharing is <b>OFF</b>. Nothing is sent." .. (Pub.Note and ("\n" .. esc(Pub.Note)) or "") end
+		if not Auth.Token then return '<font color="' .. YELLOW .. '">Sharing is ON but this account is not verified yet. You are not in the registry and nothing is sent.</font>' end
+		local s = Pub.Status
+		if s == "on" and Pub.LastOk then return '<font color="' .. GREEN .. '">Sharing is ON.</font> Last update ' .. fmtAge(os.clock() - Pub.LastOk) .. "." end
+		if s == "error" then return '<font color="' .. RED .. '">Sharing is ON but the last update failed: ' .. esc(Pub.ErrText or "unknown error") .. " Retrying with backoff.</font>" end
+		if s == "paused" then return '<font color="' .. YELLOW .. '">Sharing is ON; paused until the security connection is available.</font>' end
+		if s == "expired" then return '<font color="' .. YELLOW .. '">Your verification expired. Verify again below to resume sharing.</font>' end
+		return "Sharing is <b>ON</b>. Connecting..."
+	end
+	local function paint() if page.Visible ~= false then local t = statusText(); if status.Text ~= t then status.Text = t end end end
+	local refreshAuth = Auth.Attach(page, function() return true end)
+	lever.Changed:Connect(function(val)
+		if val == consentOn() then return end
+		SD().LivePresence = val and true or false
+		Pub.Note = nil
+		if val then
+			if Auth.Load() then Pub.Start() end
+		else
+			Pub.Stop(true)
+		end
+		paint(); pcall(refreshAuth)
+	end)
+	Pub.Hook = paint
+	Auth.Views[#Auth.Views + 1] = paint
+	paint()
+	page:GetPropertyChangedSignal("Visible"):Connect(function() if page.Visible then paint() end end)
+end
+
+-- automatic registration: a verified account registers this session ~10 s after the script starts (visibly, with a notice). A device that has
+-- never verified is invited once; it is only counted after it verifies, because the registry only contains authenticated script clients.
+task.delay(10, function()
+	if not consentOn() then return end
+	if Auth.Load() then
+		Pub.Start()
+		notify("Live Player Log: this script session is registered in the global active-user registry. Turn it off in Feature Center > SHARE MY PRESENCE.")
+	elseif SD().LivePresenceAsked ~= true then
+		SD().LivePresenceAsked = true
+		notify("Live Player Log: verify your Roblox account in Feature Center > SHARE MY PRESENCE to be counted as an active script user.")
+	end
+end)
+
+Util.LivePlayerLog = LPL

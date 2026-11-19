@@ -1,4 +1,4 @@
-// Who may VIEW the Live Player Log? The same official sources the script already uses:
+// Who may VIEW the Live Player Log, and which moderation actions each role may issue? The same official sources the script already uses:
 //   roles.json      -> entries with role "owner" | "co-owner" | "verified"
 //   whitelist.json  -> plain verified players
 // (both in the uh-mod-visual-system GitHub repo). Optional extra user ids can be set with the EXTRA_VIEWER_IDS variable.
@@ -11,6 +11,18 @@ const FRESH_MS = 30_000;      // a loaded table is reused for 30s (a role change
 const MAX_STALE_MS = 120_000; // if GitHub is unreachable the last good table is trusted for at most 2 more minutes, then every viewer is denied
 const VIEW_ROLES = new Set(["owner", "co-owner", "verified"]);
 const NAME_RE = /^[A-Za-z0-9_]{3,20}$/;
+
+/** rank used for the target check: a moderator may only act on accounts with a strictly lower rank (no role = 0) */
+export const RANK = { verified: 1, "co-owner": 2, owner: 3 };
+
+const BASE_ACTIONS = ["kick", "kill", "deanimate", "dizzy", "hallucinate"];
+
+/** Moderation actions a role may issue. BAN (and its reversal) is owner / co-owner only. Enforced by the Worker on every command. */
+export function actionsFor(role) {
+  if (role === "owner" || role === "co-owner") return [...BASE_ACTIONS, "ban"];
+  if (role === "verified") return BASE_ACTIONS;
+  return [];
+}
 
 let cache = { at: 0, table: null };
 let inflight = null;

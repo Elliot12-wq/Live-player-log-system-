@@ -1,27 +1,45 @@
-// LiveLogHub - the single Durable Object behind the Live Player Log.
+// LiveLogHub - the single Durable Object behind the Live Player Log (global script-user registry + remote moderation).
 //
-//  * Identity: NO ownership proof is required. The client claims a Roblox user id; the Worker looks up the real username on
-//    users.roblox.com and issues a random session token (only its SHA-256 is stored). Anyone can therefore claim any user id.
-//    The user id / username used afterwards come from that session, never from the request body.
-//  * Publishing presence needs a session. Viewing the list needs a session AND a viewer role (roles.js), re-checked on every request.
+//  * Identity: Roblox profile-code verification. The client claims a Roblox user id and gets a challenge code; the Worker only issues a session
+//    after it has fetched the claimed account's PUBLIC profile and found that exact code in its About text. Fails closed (Roblox unreachable,
+//    code missing, challenge expired / not bound to the caller's key => no session). The user id / username used afterwards come from the
+//    session, never from a request body. Only the SHA-256 of the session token is stored.
+//  * Publishing presence needs a session (every authenticated script client may publish). Viewing the roster and moderating need a session
+//    AND a role (roles.js), re-checked on every request. Publishing is NOT a viewing right.
+//  * The registry is ONE map keyed by Roblox user id (deduplicated). Each entry carries its live script sessions (several simultaneous
+//    sessions of one account are counted once in `onlineCount`); the newest valid session is the entry's primary session and the command target.
 //  * The list is a change log: clients send a cursor ("epoch.seq") and get only what changed (or an empty "no change" answer).
+//    Every answer carries `onlineCount` (unique accounts with unexpired presence), `sessionCount`, `cap` and `sat` (capacity reached).
 //  * Presence lives in memory and is persisted only when its content changes; heartbeats never write to storage.
+//  * Moderation commands are structured, short-lived and addressed to one target session. They ride on the target's existing heartbeat
+//    response (no extra polling); the target acknowledges on its next presence request. Status history is stored separately from the roster.
 
-import { loadRoleTable, roleFor } from "./roles.js";
+import { loadRoleTable, roleFor, actionsFor, RANK } from "./roles.js";
 
 const PRESENCE_TTL_MS = 240_000;     // abandoned presence disappears after ~2 missed heartbeats (client beats about every 100s)
-const MAX_PRESENCE = 500;
-const MAX_TOMBS = 300;               // removal log kept for delta answers; older cursors simply get a full snapshot
+const DEFAULT_MAX_PRESENCE = 5000;   // unique accounts; override with the MAX_PRESENCE variable (100..20000)
+const MAX_TOMBS = 1000;              // removal log kept for delta answers; older cursors simply get a full snapshot
 const SESSION_TTL_MS = 14 * 86_400_000;
 const SESSION_TOUCH_MS = 86_400_000; // sliding expiry is written at most once a day
-const MAX_SESSIONS_PER_USER = 5;
+const MAX_SESSIONS_PER_USER = 5;     // stored login tokens per account
+const MAX_SCRIPT_SESSIONS = 5;       // simultaneous live script sessions per account
 const CHALLENGE_TTL_MS = 600_000;
 const MIN_PRESENCE_GAP_MS = 15_000;
 const MAX_BODY = 2048;
+const CMD_TTL_MS = 300_000;          // a command must reach the target within 5 minutes (its next heartbeat) or it expires
+const REDELIVER_MS = 90_000;         // a delivered but unacknowledged command is offered again after this long (the client dedupes by id)
+const CMD_KEEP_MS = 900_000;         // finished commands stay in memory this long so the moderator sees the final status
+const MAX_HIST = 300;                // moderation history entries kept in storage
+const SAT_HOLD_MS = 900_000;         // after a registration was refused for capacity, the registry reports "saturated" for this long
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const NAME_RE = /^[A-Za-z0-9_]{3,20}$/;
 const CID_RE = /^[0-9a-f]{32}$/;
+const SID_RE = /^[0-9a-f]{16,32}$/;
+
+const ACTIONS = new Set(["kick", "kill", "deanimate", "dizzy", "hallucinate", "ban", "unban"]);
+const ACK_STATES = new Set(["EXECUTED", "REJECTED", "FAILED", "ACTION_UNSUPPORTED"]);
+const UNSUPPORTED = "ACTION NOT SUPPORTED BY CURRENT CLIENT/BACKEND AUTHORITY";
 
 const enc = new TextEncoder();
 
@@ -50,7 +68,7 @@ async function sha256hex(s) {
   return Array.from(new Uint8Array(d), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 function cleanText(v, max) {
-  return String(v ?? "").replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, "").trim().slice(0, max);
+  return String(v ?? "").replace(/[\u0000-\u001f\u007f-\u009f  ]/g, "").trim().slice(0, max);
 }
 function bearer(request) {
   const h = request.headers.get("Authorization") || "";
@@ -66,6 +84,7 @@ async function readJson(request) {
     return null;
   }
 }
+const disp = (r) => [r.d, r.pid, r.g, r.j].join("|"); // what a roster entry shows (content), as opposed to its heartbeat age
 
 export class LiveLogHub {
   constructor(state, env) {
@@ -79,17 +98,38 @@ export class LiveLogHub {
     this.seq = 1;
     this.tombFloor = 0;              // newest removal that fell out of the log
     this.tombs = [];                 // [{u, rev}] removals, oldest first
-    this.pres = new Map();           // userId -> {u, n, pid, g, j, seen, rev, crev, last}
-    this.sess = new Map();           // sha256(token) -> session record (read-through cache of storage)
+    this.pres = new Map();           // userId -> {u, n, d, pid, g, j, seen, rev, crev, last, ses: Map(sid -> session), main: sid, ns}
+    this.sess = new Map();           // sha256(token) -> login-session record (read-through cache of storage)
     this.rate = new Map();           // best-effort in-memory rate limits
+    this.bans = new Map();           // userId -> {u, n, by, bn, at, r}   (UH script/backend services ban, NOT a Roblox ban)
+    this.cmds = new Map();           // commandId -> command (recent, any status)
+    this.open = new Map();           // commandId -> command that is still PENDING / DELIVERED
+    this.hkeys = [];                 // storage keys of the moderation history, oldest first
+    this.fullAt = 0;
     this.lastPurge = 0;
     this.lastSweep = 0;
+    this.maxPres = Math.min(20000, Math.max(100, Math.floor(Number(this.env.MAX_PRESENCE)) || DEFAULT_MAX_PRESENCE));
     const now = Date.now();
+
     const stored = await this.state.storage.list({ prefix: "p:" });
     for (const [, v] of stored) {
       if (!v || typeof v.u !== "number") continue;
-      // cold start: give persisted entries one full TTL of grace; real users refresh it with their next heartbeat, ghosts expire
-      this.pres.set(v.u, { ...v, seen: now, rev: this.seq, crev: this.seq, last: 0 });
+      // cold start: persisted entries come back as one placeholder session (sid "") with one full TTL of grace; real users re-register with
+      // their next heartbeat (409 resync -> full snapshot, which replaces the placeholder), ghosts simply expire
+      const rec = { u: v.u, n: v.n, d: v.d || "", pid: v.pid, g: v.g, j: v.j, seen: now, rev: this.seq, crev: this.seq, last: 0, ses: new Map(), main: "", ns: 1 };
+      rec.ses.set("", { at: now, seen: now, last: 0, pid: v.pid, g: v.g, j: v.j, cap: new Set(), h: "" });
+      this.pres.set(v.u, rec);
+    }
+    for (const [, v] of await this.state.storage.list({ prefix: "b:" })) if (v && typeof v.u === "number") this.bans.set(v.u, v);
+    for (const [k, v] of await this.state.storage.list({ prefix: "h:" })) {
+      if (!v || typeof v.id !== "string") continue;
+      this.hkeys.push(k);
+      const c = { ...v, hk: k };
+      this.cmds.set(c.id, c);
+      if (c.st === "PENDING" || c.st === "DELIVERED") {
+        if (c.exp > now) this.open.set(c.id, c);
+        else { c.st = "EXPIRED"; c.fin = now; await this.putCmd(c); }
+      }
     }
   }
 
@@ -104,6 +144,8 @@ export class LiveLogHub {
         case "POST /live/presence": return await this.presence(request);
         case "POST /live/presence/leave": return await this.leave(request);
         case "GET /live/list": return await this.list(request, url);
+        case "POST /live/mod/command": return await this.command(request);
+        case "GET /live/mod/history": return await this.history(request);
         default: return fail(404, "not_found");
       }
     } catch (err) {
@@ -139,7 +181,26 @@ export class LiveLogHub {
       s.t = now; s.x = now + SESSION_TTL_MS;
       await this.state.storage.put("s:" + h, s);
     }
-    return { h, u: s.u, n: s.n };
+    return { h, u: s.u, n: s.n, d: s.d || "" };
+  }
+
+  /** session + ban check. Returns {s} or {res} (a ready error response). */
+  async need(request) {
+    const s = await this.session(request);
+    if (!s) return { res: fail(401, "unauthorized") };
+    if (this.bans.has(s.u)) return { res: fail(403, "banned") };
+    return { s };
+  }
+
+  /** session + ban + viewer role (re-checked against the role table on EVERY call). Returns {s, role} or {res}. */
+  async needViewer(request) {
+    const a = await this.need(request);
+    if (a.res) return a;
+    const table = await loadRoleTable(this.env);
+    if (!table) return { res: fail(503, "roles_unavailable") }; // cannot establish who is allowed => return nothing
+    const role = roleFor(table, a.s.u, a.s.n);
+    if (!role) return { res: fail(403, "forbidden") };
+    return { s: a.s, role, table };
   }
 
   async dropSession(h, s) {
@@ -150,6 +211,8 @@ export class LiveLogHub {
     if (idx.length) await this.state.storage.put(key, idx); else await this.state.storage.delete(key);
   }
 
+  touch() { return ++this.seq; }
+
   removePresence(uid) {
     if (!this.pres.delete(uid)) return false;
     this.tombs.push({ u: uid, rev: ++this.seq });
@@ -157,52 +220,93 @@ export class LiveLogHub {
     return true;
   }
 
-  async purge(now) {
-    if (now - this.lastPurge >= 10_000) {
+  persist(rec) {
+    return this.state.storage.put("p:" + rec.u, { u: rec.u, n: rec.n, d: rec.d, pid: rec.pid, g: rec.g, j: rec.j });
+  }
+
+  /** the entry shows its NEWEST valid session; an older / stale session can never replace a newer one */
+  refreshMain(rec) {
+    let main = null, seen = 0;
+    for (const [sid, x] of rec.ses) {
+      if (x.seen > seen) seen = x.seen;
+      if (!main || x.at > main[1].at) main = [sid, x];
+    }
+    rec.seen = seen;
+    rec.main = main[0];
+    rec.pid = main[1].pid; rec.g = main[1].g; rec.j = main[1].j;
+    rec.ns = rec.ses.size;
+  }
+
+  /** removes the entry's sessions matching `match`; the account leaves the registry only when no valid session remains */
+  async leaveSessions(uid, match) {
+    const rec = this.pres.get(uid);
+    if (!rec) return;
+    let cut = false;
+    for (const [sid, x] of rec.ses) if (match(sid, x)) { rec.ses.delete(sid); cut = true; }
+    if (!cut) return;
+    if (!rec.ses.size) { if (this.removePresence(uid)) await this.state.storage.delete("p:" + uid); return; }
+    const d0 = disp(rec);
+    this.refreshMain(rec);
+    rec.rev = rec.crev = this.touch();
+    if (disp(rec) !== d0) await this.persist(rec);
+  }
+
+  async purge(now, force = false) {
+    if (force || now - this.lastPurge >= 10_000) {
       this.lastPurge = now;
-      const gone = [];
-      for (const p of this.pres.values()) if (now - p.seen > PRESENCE_TTL_MS) gone.push(p.u);
+      const gone = [], cut = [];
+      for (const rec of this.pres.values()) {
+        let dead = false;
+        for (const [sid, x] of rec.ses) if (now - x.seen > PRESENCE_TTL_MS) { rec.ses.delete(sid); dead = true; }
+        if (!rec.ses.size) gone.push(rec.u); else if (dead) cut.push(rec);
+      }
       for (const uid of gone) this.removePresence(uid);
+      for (const rec of cut) {
+        const d0 = disp(rec);
+        this.refreshMain(rec);
+        rec.rev = rec.crev = this.touch();
+        if (disp(rec) !== d0) await this.persist(rec);
+      }
       for (let i = 0; i < gone.length; i += 100) await this.state.storage.delete(gone.slice(i, i + 100).map((u) => "p:" + u));
+      for (const c of [...this.open.values()]) if (c.exp <= now) await this.finish(c, "EXPIRED", "", now);
+      for (const [id, c] of this.cmds) if (!this.open.has(id) && now - (c.fin || c.iat) > CMD_KEEP_MS) this.cmds.delete(id);
     }
     if (now - this.lastSweep >= 600_000) { // expired verification challenges
       this.lastSweep = now;
       const all = await this.state.storage.list({ prefix: "c:" });
       const dead = [];
-      for (const [k, c] of all) if (!c || c.exp < now) { dead.push(k); if (c) dead.push("cu:" + c.u); }
+      for (const [k, c] of all) if (!c || c.exp < now) dead.push(k);
       for (let i = 0; i < dead.length; i += 100) await this.state.storage.delete(dead.slice(i, i + 100));
     }
   }
 
-  // ---------- sign-in (no ownership proof; the profile code is issued but no longer checked) ----------
+  // ---------- sign-in: the challenge code must be found in the claimed account's public profile ----------
   async authChallenge(request) {
     const b = await readJson(request);
     const uid = b && Number.isSafeInteger(b.userId) ? b.userId : 0;
-    if (uid < 1 || uid > 1e12) return fail(400, "bad_request");
-    if (!this.hit("ch:" + uid, 8, 3_600_000)) return fail(429, "slow");
-    const now = Date.now();
-    const existingCid = await this.state.storage.get("cu:" + uid);
-    if (existingCid && b.renew !== true) {
-      const c = await this.state.storage.get("c:" + existingCid);
-      if (c && c.u === uid && c.exp - now > 120_000) {
-        return json({ ok: true, cid: existingCid, code: c.code, ttl: Math.floor((c.exp - now) / 1000) });
-      }
-    }
-    if (existingCid) await this.state.storage.delete("c:" + existingCid);
+    // `ck` is a random secret the requesting client keeps: only the client that asked for the code can redeem it (a stranger who asks for a
+    // challenge for your user id gets a different code and cannot redeem yours)
+    const ck = b && typeof b.ck === "string" && CID_RE.test(b.ck) ? b.ck : "";
+    if (uid < 1 || uid > 1e12 || !ck) return fail(400, "bad_request");
+    if (this.bans.has(uid)) return fail(403, "banned");
+    if (!this.hit("ch:" + uid, 30, 3_600_000) || !this.hit("chg", 120, 60_000)) return fail(429, "slow");
     const cid = randomHex(16);
     const code = "UHLOG-" + randomCode(10);
-    await this.state.storage.put({ ["c:" + cid]: { u: uid, code, exp: now + CHALLENGE_TTL_MS }, ["cu:" + uid]: cid });
+    await this.state.storage.put("c:" + cid, { u: uid, code, k: await sha256hex(ck), exp: Date.now() + CHALLENGE_TTL_MS });
     return json({ ok: true, cid, code, ttl: Math.floor(CHALLENGE_TTL_MS / 1000) });
   }
 
   async authVerify(request) {
     const b = await readJson(request);
     const cid = b && typeof b.cid === "string" ? b.cid : "";
-    if (!CID_RE.test(cid)) return fail(400, "bad_request");
+    const ck = b && typeof b.ck === "string" ? b.ck : "";
+    if (!CID_RE.test(cid) || !CID_RE.test(ck)) return fail(400, "bad_request");
     if (!this.hit("vf:" + cid, 20, 600_000) || !this.hit("vfg", 120, 60_000)) return fail(429, "slow");
     const c = await this.state.storage.get("c:" + cid);
     const now = Date.now();
     if (!c || c.exp < now) return fail(410, "expired");
+    if ((await sha256hex(ck)) !== c.k) return fail(403, "forbidden"); // not the client that requested this challenge
+    if (this.bans.has(c.u)) return fail(403, "banned");
 
     let res;
     try {
@@ -218,10 +322,15 @@ export class LiveLogHub {
     try { u = await res.json(); } catch { return fail(503, "roblox_unavailable"); }
     if (!u || u.id !== c.u || typeof u.name !== "string" || !NAME_RE.test(u.name)) return fail(422, "account_invalid");
 
-    // no profile-code check: the claimed account is accepted as-is. Issue a session (the token is shown once; only its hash is stored).
+    // ownership proof: the exact challenge code must be present in the claimed account's real profile description. No code => no session.
+    const about = typeof u.description === "string" ? u.description : "";
+    if (!about.includes(c.code)) return fail(422, "code_not_found");
+
+    // issue a session bound to the VERIFIED user id / username (the token is shown once; only its hash is stored)
     const token = randomToken();
     const h = await sha256hex(token);
-    const rec = { u: c.u, n: u.name, c: now, t: now, x: now + SESSION_TTL_MS };
+    const display = cleanText(u.displayName, 32);
+    const rec = { u: c.u, n: u.name, d: display, c: now, t: now, x: now + SESSION_TTL_MS };
     const idxKey = "ui:" + c.u;
     const idx = (await this.state.storage.get(idxKey)) || [];
     idx.push(h);
@@ -231,33 +340,43 @@ export class LiveLogHub {
       await this.state.storage.delete("s:" + old);
     }
     await this.state.storage.put({ ["s:" + h]: rec, [idxKey]: idx });
-    await this.state.storage.delete(["c:" + cid, "cu:" + c.u]);
+    await this.state.storage.delete("c:" + cid);
     this.sess.set(h, rec);
-    return json({ ok: true, token, uid: c.u, name: u.name });
+    return json({ ok: true, token, uid: c.u, name: u.name, display });
   }
 
   async authLogout(request) {
     const s = await this.session(request);
     if (!s) return fail(401, "unauthorized");
-    if (this.removePresence(s.u)) await this.state.storage.delete("p:" + s.u);
+    await this.leaveSessions(s.u, (_sid, x) => x.h === s.h); // every live script session that used this login leaves the registry
     await this.dropSession(s.h, { u: s.u });
     return json({ ok: true });
   }
 
   // ---------- presence (publisher) ----------
   async presence(request) {
-    const s = await this.session(request);
-    if (!s) return fail(401, "unauthorized");
+    const a = await this.need(request);
+    if (a.res) return a.res;
+    const s = a.s;
     const b = await readJson(request);
     if (!b) return fail(400, "bad_request");
     const now = Date.now();
-    const rec = this.pres.get(s.u);
-    if (rec && now - rec.last < MIN_PRESENCE_GAP_MS) return fail(429, "slow", { retry: Math.ceil((MIN_PRESENCE_GAP_MS - (now - rec.last)) / 1000) });
+    if (!this.hit("pr:" + s.u, 40, 60_000)) return fail(429, "slow");
+    await this.purge(now);
 
-    if (b.t === "hb") { // heartbeat: only refreshes an existing entry (a missing one asks the client to send its full state)
-      if (!rec) return fail(409, "resync");
-      rec.seen = now; rec.last = now; rec.rev = ++this.seq;
-      return json({ ok: true });
+    // one script run = one session id. Older clients without a sid fall back to their login token.
+    const sid = typeof b.sid === "string" && SID_RE.test(b.sid.toLowerCase()) ? b.sid.toLowerCase() : s.h.slice(0, 16);
+    let rec = this.pres.get(s.u);
+    let ses = rec && rec.ses.get(sid);
+    const acks = Array.isArray(b.ack) ? b.ack.slice(0, 5) : [];
+    if (acks.length && ses) await this.applyAcks(s.u, sid, acks, now); // acknowledgements are never rate-limited by the heartbeat gap
+    else if (ses && now - ses.last < MIN_PRESENCE_GAP_MS) return fail(429, "slow", { retry: Math.ceil((MIN_PRESENCE_GAP_MS - (now - ses.last)) / 1000) });
+
+    if (b.t === "hb") { // heartbeat: only refreshes an existing session (a missing one asks the client to send its full state)
+      if (!ses) return fail(409, "resync");
+      ses.seen = ses.last = rec.seen = now;
+      rec.rev = this.touch();
+      return json({ ok: true, ...(await this.deliver(s.u, sid, now)) });
     }
 
     const pid = Number.isSafeInteger(b.pid) && b.pid > 0 && b.pid < 1e14 ? b.pid : 0;
@@ -265,56 +384,206 @@ export class LiveLogHub {
     const g = cleanText(b.g, 64);
     const shareJob = b.pub === true && typeof b.j === "string" && GUID_RE.test(b.j);
     const j = shareJob ? b.j.toLowerCase() : "";
-    if (!rec && this.pres.size >= MAX_PRESENCE) return fail(503, "full");
+    const dn = cleanText(b.dn, 32) || s.d; // display name: presentation only, never identity
+    const cap = new Set((Array.isArray(b.cap) ? b.cap.slice(0, 8) : []).filter((x) => typeof x === "string" && ACTIONS.has(x)));
+    if (!rec && this.pres.size >= this.maxPres) { this.fullAt = now; return fail(503, "full"); }
 
-    const changed = !rec || rec.pid !== pid || rec.g !== g || rec.j !== j;
-    const rev = ++this.seq;
-    this.pres.set(s.u, { u: s.u, n: s.n, pid, g, j, seen: now, rev, crev: changed ? rev : rec.crev, last: now });
-    if (changed) await this.state.storage.put("p:" + s.u, { u: s.u, n: s.n, pid, g, j });
-    return json({ ok: true });
+    const isNew = !rec;
+    if (isNew) rec = { u: s.u, n: s.n, d: dn, pid, g, j, seen: now, rev: 0, crev: 0, last: now, ses: new Map(), main: "", ns: 0 };
+    const d0 = isNew ? "" : disp(rec), ns0 = rec.ns;
+    rec.ses.delete(""); // placeholder left by a cold start
+    if (!ses) {
+      if (rec.ses.size >= MAX_SCRIPT_SESSIONS) { // drop the least recently seen session to make room
+        let oldest = null;
+        for (const [k, x] of rec.ses) if (!oldest || x.seen < oldest[1].seen) oldest = [k, x];
+        if (oldest) rec.ses.delete(oldest[0]);
+      }
+      ses = { at: now, seen: now, last: now, pid, g, j, cap, h: s.h };
+      rec.ses.set(sid, ses);
+    } else {
+      Object.assign(ses, { seen: now, last: now, pid, g, j, cap, h: s.h }); // `at` (session start) never moves: a late request cannot make a session "newer"
+    }
+    rec.n = s.n; rec.d = dn;
+    this.refreshMain(rec);
+    const rev = this.touch();
+    rec.rev = rev; rec.last = now;
+    const contentChanged = isNew || disp(rec) !== d0;
+    if (contentChanged || rec.ns !== ns0) rec.crev = rev;
+    this.pres.set(s.u, rec);
+    if (contentChanged) await this.persist(rec);
+    return json({ ok: true, ...(await this.deliver(s.u, sid, now)) });
   }
 
   async leave(request) {
-    const s = await this.session(request);
-    if (!s) return fail(401, "unauthorized");
-    if (this.removePresence(s.u)) await this.state.storage.delete("p:" + s.u);
+    const a = await this.need(request);
+    if (a.res) return a.res;
+    const b = (await readJson(request)) || {};
+    const sid = typeof b.sid === "string" && SID_RE.test(b.sid.toLowerCase()) ? b.sid.toLowerCase() : a.s.h.slice(0, 16);
+    await this.leaveSessions(a.s.u, (id) => id === sid);
     return json({ ok: true });
   }
 
   // ---------- list (viewer) ----------
   async list(request, url) {
-    const s = await this.session(request);
-    if (!s) return fail(401, "unauthorized");
-
-    // authorization is decided here, on every request, from the session identity (the user id is client-claimed, see authVerify)
-    const table = await loadRoleTable(this.env);
-    if (!table) return fail(503, "roles_unavailable"); // cannot establish who is allowed => return nothing
-    if (!roleFor(table, s.u, s.n)) return fail(403, "forbidden");
+    const v = await this.needViewer(request); // authorization is decided here, on every request, from the verified session identity
+    if (v.res) return v.res;
+    const { s, role } = v;
 
     const now = Date.now();
-    await this.purge(now);
+    await this.purge(now, true); // expiry is evaluated now, so onlineCount only ever counts unexpired presence
+
+    let sessions = 0;
+    for (const p of this.pres.values()) sessions += p.ses.size;
+    const meta = { e: this.epoch, s: this.seq, onlineCount: this.pres.size, sessionCount: sessions, cap: this.maxPres, role, acts: actionsFor(role) };
+    if (this.pres.size >= this.maxPres || now - this.fullAt < SAT_HOLD_MS) meta.sat = 1; // the total is a lower bound, never present it as complete
 
     const [e, q] = String(url.searchParams.get("c") || "").split(".");
     const since = e === this.epoch && /^\d{1,12}$/.test(q || "") ? Number(q) : -1;
     const etag = `"${this.epoch}.${this.seq}"`;
     const headers = { ETag: etag };
     if (request.headers.get("If-None-Match") === etag) return new Response(null, { status: 304, headers: { ...headers, "Cache-Control": "private, no-store" } });
-    if (since === this.seq) return json({ ok: true, nc: 1, e: this.epoch, s: this.seq }, 200, headers);
+    if (since === this.seq) return json({ ok: true, nc: 1, ...meta }, 200, headers);
 
     const full = since < 0 || since < this.tombFloor || since > this.seq;
     const age = (p) => Math.max(0, Math.floor((now - p.seen) / 1000));
-    const up = [], tc = [], rm = [];
+    const up = [], tc = [], rm = [], mc = [];
     for (const p of this.pres.values()) {
-      if (full || p.crev > since) up.push({ u: p.u, n: p.n, p: p.pid, g: p.g, j: p.j || undefined, a: age(p) });
+      if (full || p.crev > since) up.push({ u: p.u, n: p.n, d: p.d || undefined, p: p.pid, g: p.g, j: p.j || undefined, a: age(p), ns: p.ns > 1 ? p.ns : undefined });
       else if (p.rev > since) tc.push([p.u, age(p)]);
     }
     if (!full) for (const t of this.tombs) if (t.rev > since && !this.pres.has(t.u)) rm.push(t.u);
+    for (const c of this.cmds.values()) if (c.mu === s.u && now - c.iat < 600_000) mc.push([c.id, c.st, c.a, c.tn, c.note || ""]);
 
-    const body = { ok: true, e: this.epoch, s: this.seq };
+    const body = { ok: true, ...meta };
     if (full) body.full = true;
     if (up.length) body.up = up;
     if (tc.length) body.tc = tc;
     if (rm.length) body.rm = rm;
+    if (mc.length) body.mc = mc.slice(-12);
     return json(body, 200, headers);
+  }
+
+  // ---------- moderation ----------
+  async putCmd(c) {
+    const { hk, ...row } = c;
+    await this.state.storage.put(hk, row);
+  }
+
+  /** stores a new history entry (separate from the roster) and makes it visible to its moderator */
+  async record(c) {
+    c.hk = "h:" + String(c.iat).padStart(13, "0") + ":" + c.id.slice(0, 8);
+    this.hkeys.push(c.hk);
+    const old = [];
+    while (this.hkeys.length > MAX_HIST) old.push(this.hkeys.shift());
+    await this.putCmd(c);
+    if (old.length) await this.state.storage.delete(old);
+    this.cmds.set(c.id, c);
+    if (c.st === "PENDING") this.open.set(c.id, c);
+    this.touch();
+  }
+
+  async finish(c, st, note, now) {
+    c.st = st; c.fin = now;
+    if (note) c.note = note;
+    this.open.delete(c.id);
+    this.touch();
+    await this.putCmd(c);
+  }
+
+  /** commands for this exact target session, piggybacked on its heartbeat response */
+  async deliver(uid, sid, now) {
+    if (!this.open.size) return {};
+    const out = [];
+    for (const c of this.open.values()) {
+      if (c.tu !== uid || c.ts !== sid || c.exp <= now) continue;
+      if (c.st === "DELIVERED" && now - c.dat < REDELIVER_MS) continue; // already handed over; wait for the acknowledgement
+      if (c.st === "PENDING") { c.st = "DELIVERED"; this.touch(); }
+      c.dat = now;
+      await this.putCmd(c);
+      out.push({ id: c.id, tu: c.tu, ts: c.ts, mu: c.mu, mn: c.mn, mr: c.mr, a: c.a, iat: c.iat, exp: c.exp, ttl: c.exp - now, r: c.r || undefined, d: c.d || undefined });
+    }
+    return out.length ? { cmd: out } : {};
+  }
+
+  /** acknowledgements from the target client; only the addressed session may answer for its command */
+  async applyAcks(uid, sid, acks, now) {
+    for (const x of acks) {
+      if (!x || typeof x !== "object" || typeof x.id !== "string" || !CID_RE.test(x.id)) continue;
+      const c = this.open.get(x.id);
+      if (!c || c.tu !== uid || c.ts !== sid) continue;
+      await this.finish(c, ACK_STATES.has(x.st) ? x.st : "FAILED", cleanText(x.n, 40), now);
+    }
+  }
+
+  async command(request) {
+    const v = await this.needViewer(request); // role from the role table, never from the request
+    if (v.res) return v.res;
+    const { s, role, table } = v;
+    const b = await readJson(request);
+    if (!b) return fail(400, "bad_request");
+    if (!this.hit("cm:" + s.u, 12, 60_000)) return fail(429, "slow");
+
+    const now = Date.now();
+    const action = typeof b.a === "string" ? b.a.toLowerCase() : "";
+    const tu = Number.isSafeInteger(b.tu) ? b.tu : 0;
+    if (tu < 1 || tu === s.u) return fail(400, "bad_target");
+    const d = Number.isFinite(b.d) ? Math.min(120, Math.max(5, Math.floor(b.d))) : 0;
+    const c = { id: randomHex(16), tu, tn: "", ts: "", mu: s.u, mn: s.n, mr: role, a: cleanText(action, 12), r: cleanText(b.r, 80), d: (action === "dizzy" || action === "hallucinate") ? d : 0, iat: now, exp: now + CMD_TTL_MS, st: "PENDING" };
+    const reject = async (st, err, status, note, extra = {}) => {
+      c.st = st; c.fin = now; if (note) c.note = note;
+      await this.record(c);
+      return fail(status, err, { id: c.id, st, ...(st === "ACTION_UNSUPPORTED" ? { msg: UNSUPPORTED } : {}), ...extra });
+    };
+
+    if (!ACTIONS.has(action)) return reject("ACTION_UNSUPPORTED", "ACTION_UNSUPPORTED", 422);
+    const allowed = actionsFor(role);
+    if (!allowed.includes(action === "unban" ? "ban" : action)) return reject("REJECTED", "forbidden_action", 403, "role not permitted"); // BAN: owner / co-owner only
+
+    if (action === "unban") { // reverse a UH services ban (owner / co-owner); the target does not have to be online
+      const ban = this.bans.get(tu);
+      c.tn = ban ? ban.n : "";
+      if (!ban) return reject("FAILED", "not_banned", 404, "no ban on record");
+      this.bans.delete(tu);
+      await this.state.storage.delete("b:" + tu);
+      c.st = "EXECUTED"; c.fin = now; c.note = "ban removed";
+      await this.record(c);
+      return json({ ok: true, id: c.id, st: c.st, note: c.note });
+    }
+
+    const rec = this.pres.get(tu); // target must be an active, authenticated script user - nobody else can ever be addressed
+    if (!rec) return reject("TARGET_OFFLINE", "target_offline", 409);
+    c.tn = rec.n;
+    if ((RANK[roleFor(table, tu, rec.n)] || 0) >= (RANK[role] || 0)) return reject("REJECTED", "target_protected", 403, "target outranks or equals you");
+
+    if (action === "ban") { // backend-authoritative: takes effect at once for every UH backend service, the client exits on its next request
+      const ban = { u: tu, n: rec.n, by: s.u, bn: s.n, at: now, r: c.r };
+      this.bans.set(tu, ban);
+      await this.state.storage.put("b:" + tu, ban);
+      if (this.removePresence(tu)) await this.state.storage.delete("p:" + tu);
+      for (const o of [...this.open.values()]) if (o.tu === tu) await this.finish(o, "REJECTED", "target banned", now);
+      c.st = "EXECUTED"; c.fin = now; c.note = "backend ban applied";
+      await this.record(c);
+      return json({ ok: true, id: c.id, st: c.st, note: c.note });
+    }
+
+    const ses = rec.ses.get(rec.main); // the newest valid session of the account
+    if (!ses || rec.main === "") return reject("TARGET_OFFLINE", "target_offline", 409, "session not re-established yet");
+    if (!ses.cap.has(action)) return reject("ACTION_UNSUPPORTED", "ACTION_UNSUPPORTED", 422, "target client lacks this action");
+    for (const o of this.open.values()) if (o.tu === tu && o.a === action && o.exp > now) return fail(409, "duplicate", { id: o.id, st: o.st });
+    if (!this.hit("ct:" + tu, 6, 60_000)) return fail(429, "slow");
+
+    c.ts = rec.main;
+    await this.record(c); // PENDING: accepted by the backend, NOT yet delivered or executed
+    return json({ ok: true, id: c.id, st: "PENDING", ttl: Math.floor(CMD_TTL_MS / 1000) });
+  }
+
+  async history(request) {
+    const v = await this.needViewer(request);
+    if (v.res) return v.res;
+    if (!this.hit("hi:" + v.s.u, 10, 60_000)) return fail(429, "slow");
+    const rows = await this.state.storage.list({ prefix: "h:", reverse: true, limit: 40 });
+    const h = [];
+    for (const [, c] of rows) h.push({ id: c.id, tu: c.tu, tn: c.tn, mu: c.mu, mn: c.mn, mr: c.mr, a: c.a, r: c.r || undefined, iat: c.iat, st: c.st, note: c.note || undefined });
+    return json({ ok: true, h });
   }
 }
