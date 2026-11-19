@@ -1,0 +1,21 @@
+# Standalone deployment of the Live Player Log Worker (option B in docs/DEPLOY.md).
+# If you mount the code into the existing banner Worker instead (option A), copy the two blocks marked "REQUIRED" into ITS wrangler config.
+name = "live-player-log"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+# REQUIRED: the Durable Object that holds sessions + presence
+[[durable_objects.bindings]]
+name = "LIVE_LOG_HUB"
+class_name = "LiveLogHub"
+
+# REQUIRED: SQLite-backed Durable Object (works on the Workers free plan)
+[[migrations]]
+tag = "live-log-v1"
+new_sqlite_classes = ["LiveLogHub"]
+
+[vars]
+# Where roles.json / whitelist.json are read from (the same official files the script uses)
+ROLES_BASE = "https://raw.githubusercontent.com/Elliot12-wq/uh-mod-visual-system/main/"
+# Optional: comma separated Roblox user ids that may also VIEW the log (e.g. hard-coded verified players that are in neither file)
+EXTRA_VIEWER_IDS = ""
