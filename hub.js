@@ -1,8 +1,8 @@
 // LiveLogHub - the single Durable Object behind the Live Player Log.
 //
-//  * Identity: a user proves they own a Roblox account by putting a one-time code into their public profile "About" text.
-//    The Worker reads it from users.roblox.com itself, then issues a random session token (only its SHA-256 is stored).
-//    The user id / username used everywhere afterwards come from that verified session, never from the request body.
+//  * Identity: NO ownership proof is required. The client claims a Roblox user id; the Worker looks up the real username on
+//    users.roblox.com and issues a random session token (only its SHA-256 is stored). Anyone can therefore claim any user id.
+//    The user id / username used afterwards come from that session, never from the request body.
 //  * Publishing presence needs a session. Viewing the list needs a session AND a viewer role (roles.js), re-checked on every request.
 //  * The list is a change log: clients send a cursor ("epoch.seq") and get only what changed (or an empty "no change" answer).
 //  * Presence lives in memory and is persisted only when its content changes; heartbeats never write to storage.
@@ -174,7 +174,7 @@ export class LiveLogHub {
     }
   }
 
-  // ---------- verification (Roblox profile code) ----------
+  // ---------- sign-in (no ownership proof; the profile code is issued but no longer checked) ----------
   async authChallenge(request) {
     const b = await readJson(request);
     const uid = b && Number.isSafeInteger(b.userId) ? b.userId : 0;
@@ -218,10 +218,7 @@ export class LiveLogHub {
     try { u = await res.json(); } catch { return fail(503, "roblox_unavailable"); }
     if (!u || u.id !== c.u || typeof u.name !== "string" || !NAME_RE.test(u.name)) return fail(422, "account_invalid");
 
-    const about = String(u.description || "").toUpperCase().replace(/\s+/g, "");
-    if (!about.includes(c.code)) return fail(422, "code_not_found");
-
-    // proven: this Roblox account's owner is the caller. Issue a session (the token is shown once; only its hash is stored).
+    // no profile-code check: the claimed account is accepted as-is. Issue a session (the token is shown once; only its hash is stored).
     const token = randomToken();
     const h = await sha256hex(token);
     const rec = { u: c.u, n: u.name, c: now, t: now, x: now + SESSION_TTL_MS };
@@ -289,7 +286,7 @@ export class LiveLogHub {
     const s = await this.session(request);
     if (!s) return fail(401, "unauthorized");
 
-    // authorization is decided here, on every request, from the verified identity - never from anything the client claims
+    // authorization is decided here, on every request, from the session identity (the user id is client-claimed, see authVerify)
     const table = await loadRoleTable(this.env);
     if (!table) return fail(503, "roles_unavailable"); // cannot establish who is allowed => return nothing
     if (!roleFor(table, s.u, s.n)) return fail(403, "forbidden");
