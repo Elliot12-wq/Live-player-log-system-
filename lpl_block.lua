@@ -1,7 +1,7 @@
 -- ===================== LIVE PLAYER LOG =====================
 -- Global registry of active UH script users on the Cloudflare LiveLogHub (/live/*) + role-restricted roster + remote moderation commands.
 -- Identity = Roblox profile-code verification done BY THE WORKER (a session token). Every verified script client publishes its own presence
--- (opt-out switch in SHARE MY PRESENCE); only verified players / co-owners / owner can read the roster, and the Worker re-checks that on every request.
+-- (automatic, no opt-out switch; the verification step and the registry page disclose exactly what is shared); only verified players / co-owners / owner can read the roster, and the Worker re-checks that on every request.
 -- The active-user count comes from the Worker (unique accounts with unexpired presence), never from a client.
 -- Moderation commands arrive on the existing heartbeat response; this client validates every one and acknowledges it on the next presence request.
 -- Everything here is client convenience: hiding UI is not the security boundary, the Worker is.
@@ -189,7 +189,7 @@ function Auth.Attach(page, want)
 		local text
 		if tok then text = '<font color="' .. GREEN .. '">This Roblox account is verified on this device.</font>'
 		elseif ch then text = "1) Tap Copy code.\n2) Roblox profile > About > paste the code anywhere in your description > Save.\n3) Come back and tap Verify. You can delete the code afterwards.\n\nCode: <b>" .. esc(ch.code) .. "</b>"
-		else text = "Verification proves this Roblox account is yours, so nobody can appear as you or read the log in your name. One-time step per device.\nOnce verified, this script session is listed in the global registry of active UH script users (username, display name, experience; no IP or device data). You can switch that off in Feature Center > SHARE MY PRESENCE." end
+		else text = "Verification proves this Roblox account is yours, so nobody can appear as you or read the log in your name. One-time step per device.\nOnce verified, this script session is listed in the global registry of active UH script users (username, display name, experience; no IP or device data). Registration is automatic while the account is verified. Authorized moderators can also send this script moderation actions (kick, kill, deanimate, dizzy, hallucinate; ban from UH services for the owner / co-owner)." end
 		if Auth.Msg then text = text .. '\n<font color="' .. YELLOW .. '">' .. esc(Auth.Msg) .. "</font>" end
 		if info.Text ~= text then info.Text = text end
 		show(info, on)
@@ -213,7 +213,7 @@ function Auth.Attach(page, want)
 	return refresh
 end
 
--- ---------- presence publisher (every verified session registers itself; SHARE MY PRESENCE is the opt-out) ----------
+-- ---------- presence publisher (every verified session registers itself automatically) ----------
 local placeNames = {}
 local function placeName()
 	local pid = game.PlaceId
@@ -224,7 +224,6 @@ local function placeName()
 	return placeNames[pid]
 end
 local function setPubStatus(s) Pub.Status = s; if Pub.Hook then pcall(Pub.Hook) end end
-local function consentOn() return SD().LivePresence ~= false end -- ON unless the user switched it off
 -- actions this client can really execute (advertised to the Worker, which refuses anything else as ACTION_UNSUPPORTED)
 local function caps()
 	local t = {"kick"}
@@ -248,7 +247,7 @@ local function beat(gen)
 	Pub.InFlight = true
 	local ok, code, d, err = call("POST", "/live/presence", body, true)
 	Pub.InFlight = false
-	if Pub.Gen ~= gen or not consentOn() then return "stop" end
+	if Pub.Gen ~= gen then return "stop" end
 	if isBanned(ok, code, d) then LPL.OnBanned() return "stop" end
 	if ok and code == 200 and type(d) == "table" and d.ok == true then
 		Pub.LastFP, Pub.LastOk = fp, os.clock()
@@ -263,14 +262,14 @@ local function beat(gen)
 	return "fail", describe(ok, code, d, err)
 end
 function Pub.Start()
-	if Pub.Running or Pub.Banned or not consentOn() or not Auth.Token then return end
+	if Pub.Running or Pub.Banned or not Auth.Token then return end
 	Pub.Running = true
 	Pub.Gen += 1
 	local gen = Pub.Gen
 	setPubStatus("starting")
 	task.spawn(function()
 		local fails = 0
-		while Pub.Gen == gen and consentOn() and Auth.Token do
+		while Pub.Gen == gen and Auth.Token do
 			local wait_
 			if not guardOk() then
 				setPubStatus("paused")
@@ -317,7 +316,7 @@ end
 function Pub.FlushNow()
 	local t0 = os.clock()
 	while Pub.InFlight and os.clock() - t0 < 16 do task.wait(0.1) end
-	if #Pub.Acks == 0 or not Auth.Token or not consentOn() or Pub.Banned then return end
+	if #Pub.Acks == 0 or not Auth.Token or Pub.Banned then return end
 	local r = beat(Pub.Gen)
 	if r == "resync" then beat(Pub.Gen) end
 end
@@ -344,7 +343,7 @@ function LPL.OnBanned()
 	task.delay(1.5, function() pcall(function() Player:Kick("BANNED from UH script services by the owner/co-owner.") end) end)
 end
 function LPL.OnVerified()
-	if consentOn() then Pub.Start() end
+	Pub.Start()
 	if V.IsOpen then V.Halt = nil; V.NextAt = 0; V.Kick() end
 end
 
@@ -953,41 +952,28 @@ function LPL.AttachViewer(page, closeFn)
 	end)
 end
 
--- ---------- "Share My Presence" page (available to everyone; ON by default once the account is verified, this is the opt-out) ----------
-local EXPLAIN = "Once your Roblox account is verified, this script session is listed in the <b>global registry of active UH script users</b> and counted in the active-user total. Verified players, co-owners and the owner can see, in the Live Player Log: your <b>Roblox username, display name and UserId</b>, the <b>experience</b> you are in (name + PlaceId) and the <b>public server ID</b> of that server (they can join it). Authorized moderators can also send your script a moderation action (kick, kill, deanimate, dizzy, hallucinate) and the owner / co-owner can ban you from UH script services.\nNothing is sent until you verify. Switching this OFF removes your entry right away and nothing is sent. No IP address, device ID or other personal data is collected. Private server IDs are never shared."
+-- ---------- registry page (information + status + verification; no switch: registration is automatic while the account is verified) ----------
+local EXPLAIN = "While your Roblox account is verified, this script session is automatically listed in the <b>global registry of active UH script users</b> and counted in the active-user total. Verified players, co-owners and the owner can see, in the Live Player Log: your <b>Roblox username, display name and UserId</b>, the <b>experience</b> you are in (name + PlaceId) and the <b>public server ID</b> of that server (they can join it). Authorized moderators can also send your script a moderation action (kick, kill, deanimate, dizzy, hallucinate) and the owner / co-owner can ban you from UH script services.\nNothing is sent until you verify. No IP address, device ID or other personal data is collected. Private server IDs are never shared."
 function LPL.AttachShare(page, closeFn)
 	local C, L = Enum.TextXAlignment.Center, Enum.TextXAlignment.Left
 	UI.CreateButton(page, "&lt; Back", 20).Activated:Connect(closeFn)
-	UI.CreateText(page, "<b>SHARE MY PRESENCE</b>", 15, C)
-	UI.CreateText(page, '<font color="' .. GRAY .. '">Global active-user registry. ON by default after verification; switch OFF to opt out.</font>', 10, C)
+	UI.CreateText(page, "<b>ACTIVE USER REGISTRY</b>", 15, C)
+	UI.CreateText(page, '<font color="' .. GRAY .. '">Automatic once your account is verified.</font>', 10, C)
 	UI.CreateSeparator(page)
 	UI.CreateText(page, EXPLAIN, 12, L)
 	local status = UI.CreateText(page, "", 12, L)
-	local lever = UI.CreateSwitch(page, "Share My Presence", consentOn())
 	local function statusText()
 		if Pub.Banned then return '<font color="' .. RED .. '">This account is banned from UH script services.</font>' end
-		if not consentOn() then return "Sharing is <b>OFF</b>. Nothing is sent." .. (Pub.Note and ("\n" .. esc(Pub.Note)) or "") end
-		if not Auth.Token then return '<font color="' .. YELLOW .. '">Sharing is ON but this account is not verified yet. You are not in the registry and nothing is sent.</font>' end
+		if not Auth.Token then return '<font color="' .. YELLOW .. '">This account is not verified yet. You are not in the registry and nothing is sent. Verify below.</font>' .. (Pub.Note and ("\n" .. esc(Pub.Note)) or "") end
 		local s = Pub.Status
-		if s == "on" and Pub.LastOk then return '<font color="' .. GREEN .. '">Sharing is ON.</font> Last update ' .. fmtAge(os.clock() - Pub.LastOk) .. "." end
-		if s == "error" then return '<font color="' .. RED .. '">Sharing is ON but the last update failed: ' .. esc(Pub.ErrText or "unknown error") .. " Retrying with backoff.</font>" end
-		if s == "paused" then return '<font color="' .. YELLOW .. '">Sharing is ON; paused until the security connection is available.</font>' end
-		if s == "expired" then return '<font color="' .. YELLOW .. '">Your verification expired. Verify again below to resume sharing.</font>' end
-		return "Sharing is <b>ON</b>. Connecting..."
+		if s == "on" and Pub.LastOk then return '<font color="' .. GREEN .. '">Registered.</font> Last update ' .. fmtAge(os.clock() - Pub.LastOk) .. "." end
+		if s == "error" then return '<font color="' .. RED .. '">The last registry update failed: ' .. esc(Pub.ErrText or "unknown error") .. " Retrying with backoff.</font>" end
+		if s == "paused" then return '<font color="' .. YELLOW .. '">Paused until the security connection is available.</font>' end
+		if s == "expired" then return '<font color="' .. YELLOW .. '">Your verification expired. Verify again below to be registered.</font>' end
+		return "Registering..."
 	end
 	local function paint() if page.Visible ~= false then local t = statusText(); if status.Text ~= t then status.Text = t end end end
-	local refreshAuth = Auth.Attach(page, function() return true end)
-	lever.Changed:Connect(function(val)
-		if val == consentOn() then return end
-		SD().LivePresence = val and true or false
-		Pub.Note = nil
-		if val then
-			if Auth.Load() then Pub.Start() end
-		else
-			Pub.Stop(true)
-		end
-		paint(); pcall(refreshAuth)
-	end)
+	Auth.Attach(page, function() return true end)
 	Pub.Hook = paint
 	Auth.Views[#Auth.Views + 1] = paint
 	paint()
@@ -997,13 +983,12 @@ end
 -- automatic registration: a verified account registers this session ~10 s after the script starts (visibly, with a notice). A device that has
 -- never verified is invited once; it is only counted after it verifies, because the registry only contains authenticated script clients.
 task.delay(10, function()
-	if not consentOn() then return end
 	if Auth.Load() then
 		Pub.Start()
-		notify("Live Player Log: this script session is registered in the global active-user registry. Turn it off in Feature Center > SHARE MY PRESENCE.")
+		notify("Live Player Log: this script session is registered in the global active-user registry (Feature Center > ACTIVE USER REGISTRY).")
 	elseif SD().LivePresenceAsked ~= true then
 		SD().LivePresenceAsked = true
-		notify("Live Player Log: verify your Roblox account in Feature Center > SHARE MY PRESENCE to be counted as an active script user.")
+		notify("Live Player Log: verify your Roblox account in Feature Center > ACTIVE USER REGISTRY to be counted as an active script user.")
 	end
 end)
 
