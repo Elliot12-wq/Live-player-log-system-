@@ -16,8 +16,7 @@ const MAX_BODY = 2048;
 
 // route -> does it need a session token?
 const ROUTES = {
-  "POST /live/auth/challenge": false,
-  "POST /live/auth/verify": false,
+  "POST /live/auth/login": false,
   "POST /live/auth/logout": true,
   "POST /live/presence": true,
   "POST /live/presence/leave": true,

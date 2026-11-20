@@ -1,9 +1,10 @@
 // LiveLogHub - the single Durable Object behind the Live Player Log (global script-user registry + remote moderation).
 //
-//  * Identity: Roblox profile-code verification. The client claims a Roblox user id and gets a challenge code; the Worker only issues a session
-//    after it has fetched the claimed account's PUBLIC profile and found that exact code in its About text. Fails closed (Roblox unreachable,
-//    code missing, challenge expired / not bound to the caller's key => no session). The user id / username used afterwards come from the
-//    session, never from a request body. Only the SHA-256 of the session token is stored.
+//  * Identity: automatic sign-in, no profile code. The client states only its own Roblox user id; the Worker resolves the account from Roblox (real username /
+//    display name), checks the ban list and issues a session bound to that user id / username. The user id / username used afterwards come from the session,
+//    never from a request body. Only the SHA-256 of the session token is stored. Roles are NEVER decided here or by the client: roles.js reads roles.json
+//    (owner / co-owner / verified) and whitelist.json (verified) and every request is authorised from that table. (A user id is not secret and is not proven by this
+//    sign-in: anyone who sends the id of a listed account is treated as that account.)
 //  * Publishing presence needs a session (every authenticated script client may publish). Viewing the roster and moderating need a session
 //    AND a role (roles.js), re-checked on every request. Publishing is NOT a viewing right.
 //  * The registry is ONE map keyed by Roblox user id (deduplicated). Each entry carries its live script sessions (several simultaneous
@@ -23,7 +24,6 @@ const SESSION_TTL_MS = 14 * 86_400_000;
 const SESSION_TOUCH_MS = 86_400_000; // sliding expiry is written at most once a day
 const MAX_SESSIONS_PER_USER = 5;     // stored login tokens per account
 const MAX_SCRIPT_SESSIONS = 5;       // simultaneous live script sessions per account
-const CHALLENGE_TTL_MS = 600_000;
 const MIN_PRESENCE_GAP_MS = 15_000;
 const MAX_BODY = 2048;
 const CMD_TTL_MS = 300_000;          // a command must reach the target within 5 minutes (its next heartbeat) or it expires
@@ -31,7 +31,6 @@ const REDELIVER_MS = 90_000;         // a delivered but unacknowledged command i
 const CMD_KEEP_MS = 900_000;         // finished commands stay in memory this long so the moderator sees the final status
 const MAX_HIST = 300;                // moderation history entries kept in storage
 const SAT_HOLD_MS = 900_000;         // after a registration was refused for capacity, the registry reports "saturated" for this long
-const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const NAME_RE = /^[A-Za-z0-9_]{3,20}$/;
 const CID_RE = /^[0-9a-f]{32}$/;
@@ -54,10 +53,6 @@ const fail = (status, err, extra = {}) => json({ ok: false, err, ...extra }, sta
 function randomHex(bytes) {
   const a = crypto.getRandomValues(new Uint8Array(bytes));
   return Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
-}
-function randomCode(len) {
-  const a = crypto.getRandomValues(new Uint8Array(len));
-  return Array.from(a, (b) => CODE_ALPHABET[b % CODE_ALPHABET.length]).join("");
 }
 function randomToken() {
   const a = crypto.getRandomValues(new Uint8Array(32));
@@ -107,7 +102,6 @@ export class LiveLogHub {
     this.hkeys = [];                 // storage keys of the moderation history, oldest first
     this.fullAt = 0;
     this.lastPurge = 0;
-    this.lastSweep = 0;
     this.maxPres = Math.min(20000, Math.max(100, Math.floor(Number(this.env.MAX_PRESENCE)) || DEFAULT_MAX_PRESENCE));
     const now = Date.now();
 
@@ -120,6 +114,8 @@ export class LiveLogHub {
       rec.ses.set("", { at: now, seen: now, last: 0, pid: v.pid, g: v.g, j: v.j, cap: new Set(), h: "" });
       this.pres.set(v.u, rec);
     }
+    const legacy = [...(await this.state.storage.list({ prefix: "c:" })).keys()]; // leftovers of the removed profile-code sign-in
+    for (let i = 0; i < legacy.length; i += 100) await this.state.storage.delete(legacy.slice(i, i + 100));
     for (const [, v] of await this.state.storage.list({ prefix: "b:" })) if (v && typeof v.u === "number") this.bans.set(v.u, v);
     for (const [k, v] of await this.state.storage.list({ prefix: "h:" })) {
       if (!v || typeof v.id !== "string") continue;
@@ -138,8 +134,7 @@ export class LiveLogHub {
     const url = new URL(request.url);
     try {
       switch (`${request.method} ${url.pathname}`) {
-        case "POST /live/auth/challenge": return await this.authChallenge(request);
-        case "POST /live/auth/verify": return await this.authVerify(request);
+        case "POST /live/auth/login": return await this.authLogin(request);
         case "POST /live/auth/logout": return await this.authLogout(request);
         case "POST /live/presence": return await this.presence(request);
         case "POST /live/presence/leave": return await this.leave(request);
@@ -271,46 +266,20 @@ export class LiveLogHub {
       for (const c of [...this.open.values()]) if (c.exp <= now) await this.finish(c, "EXPIRED", "", now);
       for (const [id, c] of this.cmds) if (!this.open.has(id) && now - (c.fin || c.iat) > CMD_KEEP_MS) this.cmds.delete(id);
     }
-    if (now - this.lastSweep >= 600_000) { // expired verification challenges
-      this.lastSweep = now;
-      const all = await this.state.storage.list({ prefix: "c:" });
-      const dead = [];
-      for (const [k, c] of all) if (!c || c.exp < now) dead.push(k);
-      for (let i = 0; i < dead.length; i += 100) await this.state.storage.delete(dead.slice(i, i + 100));
-    }
   }
 
-  // ---------- sign-in: the challenge code must be found in the claimed account's public profile ----------
-  async authChallenge(request) {
+  // ---------- sign-in: automatic, no profile code ----------
+  async authLogin(request) {
     const b = await readJson(request);
     const uid = b && Number.isSafeInteger(b.userId) ? b.userId : 0;
-    // `ck` is a random secret the requesting client keeps: only the client that asked for the code can redeem it (a stranger who asks for a
-    // challenge for your user id gets a different code and cannot redeem yours)
-    const ck = b && typeof b.ck === "string" && CID_RE.test(b.ck) ? b.ck : "";
-    if (uid < 1 || uid > 1e12 || !ck) return fail(400, "bad_request");
+    if (uid < 1 || uid > 1e12) return fail(400, "bad_request");
     if (this.bans.has(uid)) return fail(403, "banned");
-    if (!this.hit("ch:" + uid, 30, 3_600_000) || !this.hit("chg", 120, 60_000)) return fail(429, "slow");
-    const cid = randomHex(16);
-    const code = "UHLOG-" + randomCode(10);
-    await this.state.storage.put("c:" + cid, { u: uid, code, k: await sha256hex(ck), exp: Date.now() + CHALLENGE_TTL_MS });
-    return json({ ok: true, cid, code, ttl: Math.floor(CHALLENGE_TTL_MS / 1000) });
-  }
+    if (!this.hit("lig", 240, 60_000)) return fail(429, "slow");
 
-  async authVerify(request) {
-    const b = await readJson(request);
-    const cid = b && typeof b.cid === "string" ? b.cid : "";
-    const ck = b && typeof b.ck === "string" ? b.ck : "";
-    if (!CID_RE.test(cid) || !CID_RE.test(ck)) return fail(400, "bad_request");
-    if (!this.hit("vf:" + cid, 20, 600_000) || !this.hit("vfg", 120, 60_000)) return fail(429, "slow");
-    const c = await this.state.storage.get("c:" + cid);
-    const now = Date.now();
-    if (!c || c.exp < now) return fail(410, "expired");
-    if ((await sha256hex(ck)) !== c.k) return fail(403, "forbidden"); // not the client that requested this challenge
-    if (this.bans.has(c.u)) return fail(403, "banned");
-
+    // the username / display name come from Roblox for that user id, never from the client
     let res;
     try {
-      res = await fetch(`https://users.roblox.com/v1/users/${c.u}`, {
+      res = await fetch(`https://users.roblox.com/v1/users/${uid}`, {
         headers: { Accept: "application/json" },
         cf: { cacheTtl: 0, cacheEverything: false },
       });
@@ -320,18 +289,15 @@ export class LiveLogHub {
     if (!res.ok) return fail(503, "roblox_unavailable");
     let u;
     try { u = await res.json(); } catch { return fail(503, "roblox_unavailable"); }
-    if (!u || u.id !== c.u || typeof u.name !== "string" || !NAME_RE.test(u.name)) return fail(422, "account_invalid");
+    if (!u || u.id !== uid || typeof u.name !== "string" || !NAME_RE.test(u.name)) return fail(422, "account_invalid");
 
-    // ownership proof: the exact challenge code must be present in the claimed account's real profile description. No code => no session.
-    const about = typeof u.description === "string" ? u.description : "";
-    if (!about.includes(c.code)) return fail(422, "code_not_found");
-
-    // issue a session bound to the VERIFIED user id / username (the token is shown once; only its hash is stored)
+    // issue a session bound to the resolved user id / username (the token is shown once; only its hash is stored)
+    const now = Date.now();
     const token = randomToken();
     const h = await sha256hex(token);
     const display = cleanText(u.displayName, 32);
-    const rec = { u: c.u, n: u.name, d: display, c: now, t: now, x: now + SESSION_TTL_MS };
-    const idxKey = "ui:" + c.u;
+    const rec = { u: uid, n: u.name, d: display, c: now, t: now, x: now + SESSION_TTL_MS };
+    const idxKey = "ui:" + uid;
     const idx = (await this.state.storage.get(idxKey)) || [];
     idx.push(h);
     while (idx.length > MAX_SESSIONS_PER_USER) {
@@ -340,9 +306,8 @@ export class LiveLogHub {
       await this.state.storage.delete("s:" + old);
     }
     await this.state.storage.put({ ["s:" + h]: rec, [idxKey]: idx });
-    await this.state.storage.delete("c:" + cid);
     this.sess.set(h, rec);
-    return json({ ok: true, token, uid: c.u, name: u.name, display });
+    return json({ ok: true, token, uid, name: u.name, display });
   }
 
   async authLogout(request) {
@@ -425,7 +390,7 @@ export class LiveLogHub {
 
   // ---------- list (viewer) ----------
   async list(request, url) {
-    const v = await this.needViewer(request); // authorization is decided here, on every request, from the verified session identity
+    const v = await this.needViewer(request); // authorization is decided here, on every request, from the signed-in session identity
     if (v.res) return v.res;
     const { s, role } = v;
 

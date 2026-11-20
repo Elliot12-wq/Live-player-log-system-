@@ -1,10 +1,11 @@
-// Who may VIEW the Live Player Log, and which moderation actions each role may issue? The same official sources the script already uses:
+// Who may VIEW the Live Player Log, and which moderation actions each role may issue? Exactly two sources, the same official files the script already uses:
 //   roles.json      -> entries with role "owner" | "co-owner" | "verified"
 //   whitelist.json  -> plain verified players
-// (both in the uh-mod-visual-system GitHub repo). Optional extra user ids can be set with the EXTRA_VIEWER_IDS variable.
+// (both in the uh-mod-visual-system GitHub repo). There is no other role source.
 //
-// The identity that is checked against this table is the one the Worker verified itself (Roblox profile-code verification).
-// A user id / name / role sent by the client is never used as proof of anything.
+// The account checked against this table is the one bound to the session at sign-in: the user id the client stated and the username Roblox reports for it.
+// A role / name / id sent in a request body is never used. Matching: an entry that has a UserId is matched by UserId only; an entry without one is matched by its
+// exact username (case-insensitive; no partial, display-name or approximate matching).
 
 const DEFAULT_BASE = "https://raw.githubusercontent.com/Elliot12-wq/uh-mod-visual-system/main/";
 const FRESH_MS = 30_000;      // a loaded table is reused for 30s (a role change reaches the log within ~30s + one request)
@@ -33,14 +34,15 @@ async function getJson(url) {
   return res.json();
 }
 
-function build(rolesJson, whitelistJson, env) {
+function build(rolesJson, whitelistJson) {
   const ids = new Map();
   const names = new Map();
   const add = (e, role) => {
     if (!e || typeof e !== "object") return;
     const id = Math.floor(Number(e.userId));
-    if (Number.isSafeInteger(id) && id > 0 && !ids.has(id)) ids.set(id, role);
-    if (typeof e.username === "string" && NAME_RE.test(e.username)) {
+    if (Number.isSafeInteger(id) && id > 0) {
+      if (!ids.has(id)) ids.set(id, role); // a UserId never changes hands; a username can (a renamed account's old name may be taken by someone else)
+    } else if (typeof e.username === "string" && NAME_RE.test(e.username)) {
       const n = e.username.toLowerCase();
       if (!names.has(n)) names.set(n, role);
     }
@@ -50,10 +52,6 @@ function build(rolesJson, whitelistJson, env) {
     if (VIEW_ROLES.has(role)) add(e, role);
   }
   for (const e of Array.isArray(whitelistJson?.entries) ? whitelistJson.entries : []) add(e, "verified");
-  for (const raw of String(env.EXTRA_VIEWER_IDS || "").split(",")) {
-    const id = Math.floor(Number(raw.trim()));
-    if (Number.isSafeInteger(id) && id > 0 && !ids.has(id)) ids.set(id, "verified");
-  }
   return { ids, names };
 }
 
@@ -63,7 +61,7 @@ async function refresh(env) {
     getJson(base + "roles.json"),
     getJson(base + "whitelist.json").catch(() => null), // an absent whitelist just means "no extra verified players"
   ]);
-  cache = { at: Date.now(), table: build(roles, whitelist, env) };
+  cache = { at: Date.now(), table: build(roles, whitelist) };
   return cache.table;
 }
 

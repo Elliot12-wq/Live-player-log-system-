@@ -1,7 +1,8 @@
 -- ===================== LIVE PLAYER LOG =====================
 -- Global registry of active UH script users on the Cloudflare LiveLogHub (/live/*) + role-restricted roster + remote moderation commands.
--- Identity = Roblox profile-code verification done BY THE WORKER (a session token). Every verified script client publishes its own presence
--- (automatic, no opt-out switch; the verification step and the registry page disclose exactly what is shared); only verified players / co-owners / owner can read the roster, and the Worker re-checks that on every request.
+-- Identity = automatic sign-in: this client states its own UserId, the Worker resolves the account from Roblox and issues a session token (no profile code, no manual step).
+-- Roles come ONLY from roles.json (owner / co-owner / verified) and whitelist.json (verified): the Worker reads them on every request. Every signed-in script client publishes its own
+-- presence (automatic; a notice and the registry page disclose exactly what is shared); only verified players / co-owners / owner can read the roster, and the Worker re-checks that on every request.
 -- The active-user count comes from the Worker (unique accounts with unexpired presence), never from a client.
 -- Moderation commands arrive on the existing heartbeat response; this client validates every one and acknowledges it on the next presence request.
 -- Everything here is client convenience: hiding UI is not the security boundary, the Worker is.
@@ -37,7 +38,7 @@ local function backend() return (tostring(LIVE_BACKEND or (Util.Guard and Util.G
 local function guardOk() local G = Util.Guard; return G == nil or G.State == "ok" end -- security handshake must have succeeded (fail closed otherwise)
 local function newId() return (HttpService:GenerateGUID(false):gsub("-", "")):lower() end
 
-local Auth = {Token = nil, Challenge = nil, CK = nil, Msg = nil, Busy = false, Views = {}, Loaded = false}
+local Auth = {Token = nil, Msg = nil, Busy = false, Views = {}, Loaded = false, SignedOut = false, Fails = 0}
 local Pub = {Gen = 0, Running = false, Status = "off", LastOk = nil, LastFP = nil, InFlight = false, Note = nil, Hook = nil, Acks = {}, Flushing = false, Banned = false}
 local Cmd = {Seen = {}, Order = {}}
 local V = {Gen = 0, IsOpen = false, Looping = false, Busy = false, CmdBusy = false, Cursor = nil, Entries = {}, Cards = {}, Interval = 45, Fails = 0, NextAt = 0, Halt = nil, ErrText = nil, ErrShown = false, LastOk = nil, ClosedAt = 0,
@@ -49,7 +50,7 @@ local function call(method, path, body, withAuth)
 	if type(rq) ~= "function" then return false, 0, nil, "this executor has no request()" end
 	local headers = {["Content-Type"] = "application/json"}
 	if withAuth then
-		if not Auth.Token then return false, 401, nil, "not verified" end
+		if not Auth.Token then return false, 401, nil, "not signed in" end
 		headers["Authorization"] = "Bearer " .. Auth.Token
 	end
 	local payload
@@ -80,11 +81,9 @@ local function isBanned(ok, code, d) return ok and code == 403 and type(d) == "t
 local function describe(ok, code, d, err)
 	if not ok then return "Cannot reach the backend (" .. tostring(err or "no response") .. ")." end
 	local e = type(d) == "table" and d.err or nil
-	if e == "code_not_found" then return "The code is not in your Roblox profile About text yet. Save it there, then tap Verify again." end
-	if e == "expired" then return "That code expired. Get a new one." end
-	if e == "forbidden" and code == 403 then return "That code was requested by another session. Get a new code." end
 	if e == "banned" then return "This account is banned from UH script services." end
 	if e == "full" then return "The global registry is at capacity right now." end
+	if e == "account_invalid" then return "Roblox could not resolve this account." end
 	if e == "roblox_unavailable" then return "The backend could not reach Roblox. Try again shortly." end
 	if e == "roles_unavailable" then return "The role list is temporarily unavailable, so nothing is shown." end
 	if code == 404 then return "The Live Player Log backend is not deployed yet." end
@@ -93,7 +92,9 @@ local function describe(ok, code, d, err)
 	return "Unexpected backend response (HTTP " .. tostring(code) .. (e and (": " .. tostring(e)) or "") .. ")."
 end
 
--- ---------- verification ----------
+-- ---------- sign-in (automatic: no code, no profile edit, no button) ----------
+-- The client only states its own UserId. The Worker resolves the real username from Roblox, binds it to the session token it issues and decides the
+-- role itself from roles.json / whitelist.json on every request. Nothing a client sends about roles is ever used.
 function Auth.Load()
 	if Auth.Token then return true end
 	if Auth.Loaded then return false end
@@ -115,48 +116,33 @@ local function saveToken(tok)
 end
 function Auth.Notify() for _, f in ipairs(Auth.Views) do pcall(f) end end
 function Auth.Forget()
-	Auth.Token, Auth.Challenge = nil, nil
+	Auth.Token = nil
 	Auth.Loaded = true
 	saveToken(nil)
 	Auth.Notify()
+	Auth.Login() -- an expired / revoked session is replaced automatically (does nothing after the user left the registry)
 end
-function Auth.Begin(renew)
-	if Auth.Busy or Auth.Token then return end
-	Auth.Busy, Auth.Msg = true, "Requesting a code..."
-	Auth.CK = newId() -- secret of THIS client: the code can only be redeemed by the client that asked for it
+function Auth.Login()
+	if Auth.Busy or Auth.Token or Auth.SignedOut then return end
+	Auth.Busy, Auth.Msg = true, nil
 	Auth.Notify()
 	task.spawn(function()
-		local ok, code, d, err = call("POST", "/live/auth/challenge", {userId = Player.UserId, ck = Auth.CK}, false)
-		Auth.Busy = false
-		if ok and code == 200 and type(d) == "table" and d.ok == true and type(d.code) == "string" and type(d.cid) == "string" then
-			Auth.Challenge = {cid = d.cid, code = d.code, exp = os.clock() + (tonumber(d.ttl) or 600)}
-			Auth.Msg = nil
-		else
-			if isBanned(ok, code, d) then LPL.OnBanned() end
-			Auth.Msg = describe(ok, code, d, err)
-		end
-		Auth.Notify()
-	end)
-end
-function Auth.Verify()
-	local ch = Auth.Challenge
-	if Auth.Busy or Auth.Token or not ch or not Auth.CK then return end
-	Auth.Busy, Auth.Msg = true, "Checking your Roblox profile..."
-	Auth.Notify()
-	task.spawn(function()
-		local ok, code, d, err = call("POST", "/live/auth/verify", {cid = ch.cid, ck = Auth.CK}, false)
+		local ok, code, d, err = call("POST", "/live/auth/login", {userId = Player.UserId}, false)
 		Auth.Busy = false
 		if ok and code == 200 and type(d) == "table" and d.ok == true and type(d.token) == "string" and #d.token >= 32 and #d.token <= 128 then
-			Auth.Token, Auth.Challenge, Auth.Msg = d.token, nil, nil
+			Auth.Token, Auth.Msg, Auth.Fails = d.token, nil, 0
 			saveToken(d.token)
 			Auth.Notify()
-			LPL.OnVerified()
+			LPL.OnSignedIn()
 			return
 		end
-		if ok and (code == 410 or (code == 403 and type(d) == "table" and d.err == "forbidden")) then Auth.Challenge = nil end
 		if isBanned(ok, code, d) then LPL.OnBanned() end
 		Auth.Msg = describe(ok, code, d, err)
 		Auth.Notify()
+		if not ok or code == 429 or code >= 500 then -- transient failure: try again quietly with backoff
+			Auth.Fails += 1
+			task.delay(math.min(600, 30 * 2 ^ math.min(Auth.Fails, 4)), Auth.Login)
+		end
 	end)
 end
 function Auth.Logout()
@@ -168,52 +154,40 @@ function Auth.Logout()
 		while (Pub.InFlight or Pub.Leaving) and os.clock() - t0 < 20 do task.wait(0.1) end
 		pcall(call, "POST", "/live/auth/logout", {}, true)
 		Auth.Busy = false
+		Auth.SignedOut = true -- stays out until the script starts again or the user rejoins (set before Forget so nothing signs in again)
 		Auth.Forget()
 		V.Wipe()
-		notify("Live Player Log: verification removed from this device.")
+		notify("Live Player Log: you left the registry for this session.")
 	end)
 end
--- shared verification controls; `want()` decides when the section is shown
+-- sign-in status + the leave / rejoin control; `want()` decides when the section is shown
 function Auth.Attach(page, want)
 	local info = UI.CreateText(page, "", 11, Enum.TextXAlignment.Left)
-	local getBtn = UI.CreateButton(page, "Get verification code", 18)
-	local copyBtn = UI.CreateButton(page, "Copy code", 18)
-	local verBtn = UI.CreateButton(page, "I added it - Verify", 18)
-	local newBtn = UI.CreateButton(page, "Get a new code", 18)
-	local outBtn = UI.CreateButton(page, "Remove verification from this device", 18)
+	local joinBtn = UI.CreateButton(page, "Rejoin the registry", 18)
+	local outBtn = UI.CreateButton(page, "Leave the registry for this session", 18)
 	local function show(x, on) local c = x.Parent; if c then c.Visible = on end end
 	local function refresh()
-		local tok, ch = Auth.Token, Auth.Challenge
-		if ch and os.clock() > ch.exp then Auth.Challenge, ch = nil, nil end
+		local tok = Auth.Token
 		local on = want() == true
 		local text
-		if tok then text = '<font color="' .. GREEN .. '">This Roblox account is verified on this device.</font>'
-		elseif ch then text = "1) Tap Copy code.\n2) Roblox profile > About > paste the code anywhere in your description > Save.\n3) Come back and tap Verify. You can delete the code afterwards.\n\nCode: <b>" .. esc(ch.code) .. "</b>"
-		else text = "Verification proves this Roblox account is yours, so nobody can appear as you or read the log in your name. One-time step per device.\nOnce verified, this script session is listed in the global registry of active UH script users (username, display name, experience; no IP or device data). Registration is automatic while the account is verified. Authorized moderators can also send this script moderation actions (kick, kill, deanimate, dizzy, hallucinate; ban from UH services for the owner / co-owner)." end
+		if tok then text = '<font color="' .. GREEN .. '">Signed in automatically as ' .. esc(Player.Name) .. ". Nothing to verify: your role comes from the official role lists.</font>"
+		elseif Auth.SignedOut then text = "You left the registry for this session. You are not listed and nothing is sent. The script signs in again automatically the next time it starts."
+		elseif Auth.Busy then text = "Signing in with this Roblox account..."
+		else text = "Signing in automatically with this Roblox account. Nothing to verify or paste." end
 		if Auth.Msg then text = text .. '\n<font color="' .. YELLOW .. '">' .. esc(Auth.Msg) .. "</font>" end
 		if info.Text ~= text then info.Text = text end
 		show(info, on)
-		show(getBtn, on and not tok and not ch and not Auth.Busy)
-		show(copyBtn, on and not tok and ch ~= nil)
-		show(verBtn, on and not tok and ch ~= nil and not Auth.Busy)
-		show(newBtn, on and not tok and ch ~= nil and not Auth.Busy)
+		show(joinBtn, on and not tok and Auth.SignedOut)
 		show(outBtn, on and tok ~= nil)
 	end
-	getBtn.Activated:Connect(function() Auth.Begin(false) end)
-	newBtn.Activated:Connect(function() Auth.Challenge = nil; Auth.Begin(true) end)
-	verBtn.Activated:Connect(Auth.Verify)
+	joinBtn.Activated:Connect(function() Auth.SignedOut = false; Auth.Login() end)
 	outBtn.Activated:Connect(Auth.Logout)
-	copyBtn.Activated:Connect(function()
-		local ch = Auth.Challenge
-		if not ch then return end
-		if type(setclipboard) == "function" then pcall(setclipboard, ch.code); notify("Code copied.") else notify("Code: " .. ch.code) end
-	end)
 	Auth.Views[#Auth.Views + 1] = refresh
 	refresh()
 	return refresh
 end
 
--- ---------- presence publisher (every verified session registers itself automatically) ----------
+-- ---------- presence publisher (every signed-in session registers itself automatically) ----------
 local placeNames = {}
 local function placeName()
 	local pid = game.PlaceId
@@ -342,8 +316,9 @@ function LPL.OnBanned()
 	notify("Live Player Log: this account is banned from UH script services.")
 	task.delay(1.5, function() pcall(function() Player:Kick("BANNED from UH script services by the owner/co-owner.") end) end)
 end
-function LPL.OnVerified()
+function LPL.OnSignedIn()
 	Pub.Start()
+	if not LPL.Told then LPL.Told = true; notify("Live Player Log: this script session is registered in the global active-user registry (Feature Center > ACTIVE USER REGISTRY).") end
 	if V.IsOpen then V.Halt = nil; V.NextAt = 0; V.Kick() end
 end
 
@@ -511,7 +486,7 @@ local function copyIds(e)
 end
 local function profileUrl(e) return "https://www.roblox.com/users/" .. e.id .. "/profile" end
 
--- one moderation command from this moderator (the Worker authorises it again from the verified session; nothing here is trusted)
+-- one moderation command from this moderator (the Worker authorises it again from the signed-in session; nothing here is trusted)
 function V.SendCommand(e, act)
 	if V.CmdBusy or not Auth.Token then return end
 	V.CmdBusy = true
@@ -674,7 +649,7 @@ local function overviewText(now)
 		.. "\nUnique accounts with presence refreshed in the last 4 minutes, all servers and experiences.</font>\nRegistry: " .. reg
 end
 local function statusLine()
-	if V.Halt == "auth" then return '<font color="' .. YELLOW .. '">Verify your Roblox account below to load the list.</font>' end
+	if V.Halt == "auth" then return '<font color="' .. YELLOW .. '">Signing in automatically. The list loads as soon as the session is ready.</font>' end
 	if V.Halt == "denied" then return '<font color="' .. RED .. '">The server did not authorize this account for the Live Player Log.</font>' end
 	if V.Halt == "gate" then return '<font color="' .. RED .. '">Only verified players, co-owners and the owner can use the Live Player Log.</font>' end
 	if V.ErrText then return '<font color="' .. RED .. '">' .. esc(V.ErrText) .. "</font>" end
@@ -806,7 +781,7 @@ function V.Poll()
 	if V.Busy then return end
 	if not LPL.CanView() then V.Wipe(); V.Halt = "gate" return end -- permission lost: drop everything cached
 	if not guardOk() then V.ErrText = "Security connection unavailable - paused."; V.NextAt = os.clock() + 30 return end
-	if not Auth.Token and not Auth.Load() then V.Wipe(); V.Halt = "auth"; Auth.Notify() return end
+	if not Auth.Token and not Auth.Load() then V.Wipe(); V.Halt = "auth"; Auth.Login(); Auth.Notify() return end
 	V.Busy = true
 	local ok, code, d, err = call("GET", "/live/list" .. (V.Cursor and ("?c=" .. V.Cursor) or ""), nil, true)
 	V.Busy = false
@@ -833,7 +808,7 @@ function V.Poll()
 		return
 	end
 	if isBanned(ok, code, d) then LPL.OnBanned() return end
-	if ok and code == 401 then V.Wipe(); V.Halt = "auth"; Auth.Forget() return end -- token expired / revoked (Forget refreshes the verification controls)
+	if ok and code == 401 then V.Wipe(); V.Halt = "auth"; Auth.Forget() return end -- token expired / revoked (Forget signs in again automatically)
 	if ok and code == 403 then V.Wipe(); V.Halt = "denied" return end -- the server says no: nothing stays cached
 	V.Fails += 1
 	local wait_ = math.min(300, 30 * 2 ^ math.min(V.Fails, 4))
@@ -851,7 +826,7 @@ function V.Kick()
 			if not V.Halt and os.clock() >= V.NextAt then V.Poll() end
 			if V.Gen ~= gen then break end
 			V.Render()
-			if V.Halt then break end -- authorization problem: stop polling until the user retries / verifies
+			if V.Halt then break end -- no session yet / authorization problem: stop polling until the session is ready or the user retries
 			task.wait(10)
 		end
 		if V.Gen == gen then V.Looping = false end
@@ -963,24 +938,24 @@ function LPL.AttachViewer(page, closeFn)
 	end)
 end
 
--- ---------- registry page (information + status + verification; no switch: registration is automatic while the account is verified) ----------
-local EXPLAIN = "While your Roblox account is verified, this script session is automatically listed in the <b>global registry of active UH script users</b> and counted in the active-user total. Verified players, co-owners and the owner can see, in the Live Player Log: your <b>Roblox username, display name and UserId</b>, the <b>experience</b> you are in (name + PlaceId) and the <b>public server ID</b> of that server (they can join it). Authorized moderators can also send your script a moderation action (kick, kill, deanimate, dizzy, hallucinate) and the owner / co-owner can ban you from UH script services.\nNothing is sent until you verify. No IP address, device ID or other personal data is collected. Private server IDs are never shared."
+-- ---------- registry page (information + status; no switch: registration is automatic while the script runs) ----------
+local EXPLAIN = "While this script runs, your session is automatically listed in the <b>global registry of active UH script users</b> and counted in the active-user total. Verified players, co-owners and the owner can see, in the Live Player Log: your <b>Roblox username, display name and UserId</b>, the <b>experience</b> you are in (name + PlaceId) and the <b>public server ID</b> of that server (they can join it). Authorized moderators can also send your script a moderation action (kick, kill, deanimate, dizzy, hallucinate) and the owner / co-owner can ban you from UH script services.\nNo IP address, device ID or other personal data is collected. Private server IDs are never shared. You can leave the registry for the current session below."
 function LPL.AttachShare(page, closeFn)
 	local C, L = Enum.TextXAlignment.Center, Enum.TextXAlignment.Left
 	UI.CreateButton(page, "&lt; Back", 20).Activated:Connect(closeFn)
 	UI.CreateText(page, "<b>ACTIVE USER REGISTRY</b>", 15, C)
-	UI.CreateText(page, '<font color="' .. GRAY .. '">Automatic once your account is verified.</font>', 10, C)
+	UI.CreateText(page, '<font color="' .. GRAY .. '">Automatic while the script is running.</font>', 10, C)
 	UI.CreateSeparator(page)
 	UI.CreateText(page, EXPLAIN, 12, L)
 	local status = UI.CreateText(page, "", 12, L)
 	local function statusText()
 		if Pub.Banned then return '<font color="' .. RED .. '">This account is banned from UH script services.</font>' end
-		if not Auth.Token then return '<font color="' .. YELLOW .. '">This account is not verified yet. You are not in the registry and nothing is sent. Verify below.</font>' .. (Pub.Note and ("\n" .. esc(Pub.Note)) or "") end
+		if not Auth.Token then return '<font color="' .. YELLOW .. '">' .. (Auth.SignedOut and "You left the registry for this session. You are not listed and nothing is sent." or "Signing in automatically. You are listed as soon as the session is ready.") .. "</font>" .. (Pub.Note and ("\n" .. esc(Pub.Note)) or "") end
 		local s = Pub.Status
 		if s == "on" and Pub.LastOk then return '<font color="' .. GREEN .. '">Registered.</font> Last update ' .. fmtAge(os.clock() - Pub.LastOk) .. "." end
 		if s == "error" then return '<font color="' .. RED .. '">The last registry update failed: ' .. esc(Pub.ErrText or "unknown error") .. " Retrying with backoff.</font>" end
 		if s == "paused" then return '<font color="' .. YELLOW .. '">Paused until the security connection is available.</font>' end
-		if s == "expired" then return '<font color="' .. YELLOW .. '">Your verification expired. Verify again below to be registered.</font>' end
+		if s == "expired" then return '<font color="' .. YELLOW .. '">Your session expired. Signing in again automatically.</font>' end
 		return "Registering..."
 	end
 	local function roleLine() local r = V.Role; return r and ('<font color="' .. GREEN .. '">Role: ' .. (r == "co-owner" and "Co-Owner" or (r:sub(1, 1):upper() .. r:sub(2))) .. "</font>\n") or "" end
@@ -992,14 +967,11 @@ function LPL.AttachShare(page, closeFn)
 	page:GetPropertyChangedSignal("Visible"):Connect(function() if page.Visible then paint() end end)
 end
 
-task.spawn(function() V.Role = LPL.LocalRole(true); Auth.Notify() end) -- role recognised from the banner lists at start, no manual verification
--- automatic registration: a verified account registers this session ~10 s after the script starts (visibly, with a notice). A device that has
--- never verified is invited once; it is only counted after it verifies, because the registry only contains authenticated script clients.
+task.spawn(function() V.Role = LPL.LocalRole(true); Auth.Notify() end) -- role recognised from the banner lists at start
+-- automatic registration: ~10 s after the script starts this session signs in on its own (saved session, otherwise a fresh sign-in) and registers,
+-- with a visible notice (LPL.OnSignedIn). The Worker decides the role from roles.json / whitelist.json; ordinary users simply get no roster access.
 task.delay(10, function()
-	if Auth.Load() then
-		Pub.Start()
-		notify("Live Player Log: this script session is registered in the global active-user registry (Feature Center > ACTIVE USER REGISTRY).")
-	end
+	if Auth.Load() then LPL.OnSignedIn() else Auth.Login() end
 end)
 
 Util.LivePlayerLog = LPL

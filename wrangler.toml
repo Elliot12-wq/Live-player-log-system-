@@ -17,7 +17,5 @@ new_sqlite_classes = ["LiveLogHub"]
 [vars]
 # Where roles.json / whitelist.json are read from (the same official files the script uses)
 ROLES_BASE = "https://raw.githubusercontent.com/Elliot12-wq/uh-mod-visual-system/main/"
-# Optional: comma separated Roblox user ids that may also VIEW the log (e.g. hard-coded verified players that are in neither file)
-EXTRA_VIEWER_IDS = ""
 # Capacity of the global registry in unique accounts (100..20000). When it is reached the list reports "sat" instead of a misleading total.
 MAX_PRESENCE = "5000"
