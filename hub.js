@@ -97,6 +97,7 @@ export class LiveLogHub {
     this.sess = new Map();           // sha256(token) -> login-session record (read-through cache of storage)
     this.rate = new Map();           // best-effort in-memory rate limits
     this.bans = new Map();           // userId -> {u, n, by, bn, at, r}   (UH script/backend services ban, NOT a Roblox ban)
+    this.dormant = new Map();        // userId -> expiry of a persisted entry from before a cold start: inert recovery data, NOT live presence (never listed, never targetable)
     this.cmds = new Map();           // commandId -> command (recent, any status)
     this.open = new Map();           // commandId -> command that is still PENDING / DELIVERED
     this.hkeys = [];                 // storage keys of the moderation history, oldest first
@@ -108,11 +109,10 @@ export class LiveLogHub {
     const stored = await this.state.storage.list({ prefix: "p:" });
     for (const [, v] of stored) {
       if (!v || typeof v.u !== "number") continue;
-      // cold start: persisted entries come back as one placeholder session (sid "") with one full TTL of grace; real users re-register with
-      // their next heartbeat (409 resync -> full snapshot, which replaces the placeholder), ghosts simply expire
-      const rec = { u: v.u, n: v.n, d: v.d || "", pid: v.pid, g: v.g, j: v.j, seen: now, rev: this.seq, crev: this.seq, last: 0, ses: new Map(), main: "", ns: 1 };
-      rec.ses.set("", { at: now, seen: now, last: 0, pid: v.pid, g: v.g, j: v.j, cap: new Set(), h: "" });
-      this.pres.set(v.u, rec);
+      // cold start: a persisted entry has no live script session (no sid, no capabilities, unknown last heartbeat), so it is NOT put back into the
+      // roster and cannot be counted or targeted. It is kept only as inert recovery data until its real client re-registers (its next heartbeat gets
+      // 409 resync -> full snapshot -> a real session with real capabilities); if that never happens the record is deleted after one TTL (see purge)
+      this.dormant.set(v.u, now + PRESENCE_TTL_MS);
     }
     const legacy = [...(await this.state.storage.list({ prefix: "c:" })).keys()]; // leftovers of the removed profile-code sign-in
     for (let i = 0; i < legacy.length; i += 100) await this.state.storage.delete(legacy.slice(i, i + 100));
@@ -239,11 +239,30 @@ export class LiveLogHub {
     let cut = false;
     for (const [sid, x] of rec.ses) if (match(sid, x)) { rec.ses.delete(sid); cut = true; }
     if (!cut) return;
-    if (!rec.ses.size) { if (this.removePresence(uid)) await this.state.storage.delete("p:" + uid); return; }
+    if (!rec.ses.size) {
+      if (this.removePresence(uid)) await this.state.storage.delete("p:" + uid); // tombstone for delta lists + persisted record gone; onlineCount drops with the map
+      await this.settleCmds(uid, Date.now());
+      return;
+    }
     const d0 = disp(rec);
     this.refreshMain(rec);
     rec.rev = rec.crev = this.touch();
     if (disp(rec) !== d0) await this.persist(rec);
+    await this.settleCmds(uid, Date.now());
+  }
+
+  /** open commands of `uid` whose addressed session no longer exists. A PENDING one moves to the SAME account's current primary session when that session
+   *  supports the action; everything else is finished, so nothing stays stranded on a departed sid or can fire after a later rejoin. */
+  async settleCmds(uid, now) {
+    if (!this.open.size) return;
+    const rec = this.pres.get(uid);
+    const next = rec && rec.main ? rec.ses.get(rec.main) : null;
+    for (const c of [...this.open.values()]) {
+      if (c.tu !== uid || (rec && rec.ses.has(c.ts))) continue;
+      if (c.st === "PENDING" && next && next.cap.has(c.a)) { c.ts = rec.main; await this.putCmd(c); this.touch(); }
+      else if (c.st === "PENDING" && next) await this.finish(c, "ACTION_UNSUPPORTED", "new primary session lacks this action", now);
+      else await this.finish(c, "TARGET_OFFLINE", next ? "target session ended before acknowledging" : "target left the game", now);
+    }
   }
 
   async purge(now, force = false) {
@@ -262,7 +281,12 @@ export class LiveLogHub {
         rec.rev = rec.crev = this.touch();
         if (disp(rec) !== d0) await this.persist(rec);
       }
+      for (const [u, exp] of this.dormant) { // persisted entries whose client never came back after a cold start
+        if (this.pres.has(u)) this.dormant.delete(u);
+        else if (exp <= now) { this.dormant.delete(u); gone.push(u); }
+      }
       for (let i = 0; i < gone.length; i += 100) await this.state.storage.delete(gone.slice(i, i + 100).map((u) => "p:" + u));
+      for (const uid of new Set([...gone, ...cut.map((r) => r.u)])) await this.settleCmds(uid, now); // never leave a command on a session that expired
       for (const c of [...this.open.values()]) if (c.exp <= now) await this.finish(c, "EXPIRED", "", now);
       for (const [id, c] of this.cmds) if (!this.open.has(id) && now - (c.fin || c.iat) > CMD_KEEP_MS) this.cmds.delete(id);
     }
@@ -356,7 +380,7 @@ export class LiveLogHub {
     const isNew = !rec;
     if (isNew) rec = { u: s.u, n: s.n, d: dn, pid, g, j, seen: now, rev: 0, crev: 0, last: now, ses: new Map(), main: "", ns: 0 };
     const d0 = isNew ? "" : disp(rec), ns0 = rec.ns;
-    rec.ses.delete(""); // placeholder left by a cold start
+    this.dormant.delete(s.u); // a real session is being registered: the persisted record is live again (persist() below rewrites it)
     if (!ses) {
       if (rec.ses.size >= MAX_SCRIPT_SESSIONS) { // drop the least recently seen session to make room
         let oldest = null;
@@ -515,8 +539,9 @@ export class LiveLogHub {
       return json({ ok: true, id: c.id, st: c.st, note: c.note });
     }
 
+    await this.purge(now, true); // expire stale sessions first: a target is addressable only while it has a live, unexpired script session
     const rec = this.pres.get(tu); // target must be an active, authenticated script user - nobody else can ever be addressed
-    if (!rec) return reject("TARGET_OFFLINE", "target_offline", 409);
+    if (!rec) return reject("TARGET_OFFLINE", "target_offline", 409, "target is not connected", { gone: true });
     c.tn = rec.n;
     if ((RANK[roleFor(table, tu, rec.n)] || 0) >= (RANK[role] || 0)) return reject("REJECTED", "target_protected", 403, "target outranks or equals you");
 
@@ -531,8 +556,9 @@ export class LiveLogHub {
       return json({ ok: true, id: c.id, st: c.st, note: c.note });
     }
 
-    const ses = rec.ses.get(rec.main); // the newest valid session of the account
-    if (!ses || rec.main === "") return reject("TARGET_OFFLINE", "target_offline", 409, "session not re-established yet");
+    let ses = rec.main ? rec.ses.get(rec.main) : null; // the newest valid session of the account
+    if (!ses && rec.ses.size) { this.refreshMain(rec); ses = rec.ses.get(rec.main); } // routing pointed at a sid that is gone: re-select among real sessions
+    if (!ses || !rec.main) return reject("TARGET_OFFLINE", "target_offline", 409, "session not re-established yet");
     if (!ses.cap.has(action)) return reject("ACTION_UNSUPPORTED", "ACTION_UNSUPPORTED", 422, "target client lacks this action");
     for (const o of this.open.values()) if (o.tu === tu && o.a === action && o.exp > now) return fail(409, "duplicate", { id: o.id, st: o.st });
     if (!this.hit("ct:" + tu, 6, 60_000)) return fail(429, "slow");

@@ -209,6 +209,7 @@ local function caps()
 	return t
 end
 local function beat(gen)
+	if Pub.Departed then return "stop" end -- this session has left the game: it can never register itself again
 	local pub = game.PrivateServerId == "" and game.JobId ~= ""
 	local snap = {pid = game.PlaceId, g = placeName():sub(1, 64), j = pub and game.JobId or "", pub = pub, sid = SID, dn = tostring(Player.DisplayName or ""):sub(1, 32), cap = caps()}
 	local fp = snap.pid .. "|" .. snap.g .. "|" .. snap.j .. "|" .. snap.dn
@@ -236,7 +237,7 @@ local function beat(gen)
 	return "fail", describe(ok, code, d, err)
 end
 function Pub.Start()
-	if Pub.Running or Pub.Banned or not Auth.Token then return end
+	if Pub.Running or Pub.Banned or Pub.Departed or not Auth.Token then return end
 	Pub.Running = true
 	Pub.Gen += 1
 	local gen = Pub.Gen
@@ -270,11 +271,11 @@ end
 function Pub.Stop(remove)
 	Pub.Gen += 1
 	Pub.Running, Pub.LastFP = false, nil
-	if not remove or not Auth.Token or Pub.Leaving then setPubStatus("off") return end
+	if not remove or not Auth.Token or Pub.Leaving or Pub.Departed then setPubStatus("off") return end
 	Pub.Leaving = true
 	task.spawn(function()
 		local t0 = os.clock()
-		while Pub.InFlight and os.clock() - t0 < 16 do task.wait(0.1) end
+		while Pub.InFlight and not Pub.Departed and os.clock() - t0 < 16 do task.wait(0.1) end
 		local removed = false
 		for attempt = 1, 2 do
 			local ok, code = call("POST", "/live/presence/leave", {sid = SID}, true)
@@ -284,6 +285,46 @@ function Pub.Stop(remove)
 		Pub.Leaving = false
 		Pub.Note = removed and "Your entry was removed." or "The backend could not be reached; your entry expires on its own within 4 minutes."
 		setPubStatus("off")
+	end)
+end
+-- the local player leaves the game (or teleports away): ONE idempotent handler removes THIS script session (sid) from the registry at once.
+-- Only the sid is removed: the login token stays valid and other sessions of the account are untouched (no Auth.Logout). A request already in flight
+-- is not waited for (the client may be closing); if one was running, the leave is repeated once after it ends, because it may have landed after the first.
+-- A forced close / crash / dead network cannot send anything: the Worker's 4 minute expiry remains the fallback.
+function Pub.Depart(why)
+	if Pub.Departed then return end
+	Pub.Departed = true
+	Pub.Gen += 1 -- stops the heartbeat loop; beat() / Pub.Start() refuse to register once Departed is set
+	Pub.Running, Pub.LastFP = false, nil
+	if not Auth.Token or Pub.Banned or Pub.Leaving then setPubStatus("off") return end -- not registered / a leave (manual or earlier) is already handling it
+	Pub.Leaving = true
+	task.spawn(function()
+		local late = Pub.InFlight
+		local removed = false
+		for attempt = 1, 2 do
+			local ok, code = call("POST", "/live/presence/leave", {sid = SID}, true)
+			if ok and (code == 200 or code == 401 or code == 404) then removed = true break end
+			if attempt == 1 then task.wait(1) end
+		end
+		if late and removed then
+			local t0 = os.clock()
+			while Pub.InFlight and os.clock() - t0 < 5 do task.wait(0.1) end
+			call("POST", "/live/presence/leave", {sid = SID}, true)
+		end
+		Pub.Leaving = false
+		Pub.Note = removed and "Your entry was removed." or "The backend could not be reached; your entry expires on its own within 4 minutes."
+		setPubStatus("off")
+	end)
+end
+-- the teleport did not happen (the player is still in the game): register this session again
+function Pub.Resume()
+	if not Pub.Departed or Pub.Banned then return end
+	task.spawn(function()
+		local t0 = os.clock()
+		while Pub.Leaving and os.clock() - t0 < 20 do task.wait(0.1) end
+		if not Pub.Departed or Player.Parent == nil then return end
+		Pub.Departed = false
+		if Auth.Token and not Auth.SignedOut then Pub.Start() end
 	end)
 end
 -- send queued acknowledgements right now (one extra request, only after a moderation command); blocks until it is sent
@@ -508,6 +549,13 @@ function V.SendCommand(e, act)
 			V.Interval, V.NextAt = 20, os.clock() + 20
 		elseif isBanned(ok, code, d) then LPL.OnBanned()
 		elseif ok and code == 401 then Auth.Forget(); V.Halt = "auth"
+		elseif ok and type(d) == "table" and (d.err == "target_offline" or d.st == "TARGET_OFFLINE") then
+			-- the Worker holds no live session for this target: never shown as executed. Drop the card when the account is gone and take a fresh snapshot now.
+			if type(d.id) == "string" then V.Cmds[d.id] = {st = "TARGET_OFFLINE", a = act, tn = e.n, note = tostring(d.note or ""), t = os.clock(), noted = true} end
+			notify(label .. ": " .. (d.gone and (e.n .. " is no longer connected.") or (e.n .. "'s session is not connected right now (it may be re-establishing). Refreshing the list...")))
+			if d.gone then V.Entries[e.id] = nil end
+			V.Cursor, V.NextAt = nil, 0
+			if V.IsOpen then if V.Looping then task.spawn(function() V.Poll(); V.Render() end) else V.Kick() end end
 		elseif ok and type(d) == "table" then
 			if d.msg then notify(label .. ": " .. tostring(d.msg))
 			else notify(label .. ": " .. tostring(d.st or d.err or ("HTTP " .. code))) end
@@ -769,7 +817,7 @@ local function applyMeta(d)
 				if isNew then x.noted = FINAL[st] == true
 				elseif FINAL[st] and not x.noted then
 					x.noted = true
-					notify(x.a:upper() .. " on " .. x.tn .. ": " .. st .. (x.note ~= "" and (" (" .. x.note .. ")") or ""))
+					notify(x.a:upper() .. " on " .. x.tn .. ": " .. (st == "TARGET_OFFLINE" and "the target is no longer connected" or st) .. (x.note ~= "" and (" (" .. x.note .. ")") or ""))
 				end
 			end
 		end
@@ -994,6 +1042,17 @@ function LPL.AttachShare(page, closeFn)
 	paint()
 	page:GetPropertyChangedSignal("Visible"):Connect(function() if page.Visible then paint() end end)
 end
+
+-- local-player departure: only THIS player's own events count (another player leaving the server never triggers it)
+pcall(function() Players.PlayerRemoving:Connect(function(p) if p == Player then Pub.Depart("leaving") end end) end)
+pcall(function() Player.AncestryChanged:Connect(function(_, parent) if parent == nil then Pub.Depart("removed") end end) end)
+pcall(function()
+	Player.OnTeleport:Connect(function(state)
+		if state == Enum.TeleportState.InProgress then Pub.Depart("teleport")
+		elseif state == Enum.TeleportState.Failed then Pub.Resume() end
+	end)
+end)
+pcall(function() TeleportService.TeleportInitFailed:Connect(function(plr) if plr == Player then Pub.Resume() end end) end)
 
 task.spawn(function() V.Role = LPL.LocalRole(true); Auth.Notify() end) -- role recognised from the banner lists at start
 -- automatic registration: ~10 s after the script starts this session signs in on its own (saved session, otherwise a fresh sign-in) and registers,
