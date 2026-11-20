@@ -423,8 +423,19 @@ end
 
 -- ---------- viewer ----------
 function LPL.CanView(refresh) return Util.Roles.CanUseLivePlayerLog(Player, refresh) == true end
+-- local role state: read straight from the banner system's username / role lists (Roles.Of + verified lists + BannerRole). No verification step; regular users get nil.
+-- Display state only: the Worker still authorises every roster / presence / moderation request itself.
+function LPL.LocalRole(refresh)
+	local R = Util.Roles
+	if refresh then pcall(R.Fetch) end
+	local ok, role = pcall(R.Of, Player)
+	if ok and (role == "owner" or role == "co-owner") then return role end
+	if R.CanUseLivePlayerLog(Player) then return "verified" end
+	return nil
+end
 function V.Wipe()
 	V.Entries, V.Cursor, V.Count, V.Sessions, V.Sat, V.LastOk, V.Acts, V.ActSig, V.Role, V.Cmds = {}, nil, 0, 0, false, nil, {}, "", nil, {}
+	V.Role = LPL.LocalRole()
 	for id, c in pairs(V.Cards) do pcall(function() c.frame:Destroy() end); V.Cards[id] = nil end
 end
 local function newLabel(parent, size, order)
@@ -736,7 +747,7 @@ local function applyMeta(d)
 	if tonumber(d.sessionCount) then V.Sessions = math.max(0, math.floor(d.sessionCount)) end
 	if tonumber(d.cap) then V.Cap = math.floor(d.cap) end
 	V.Sat = d.sat == 1
-	if type(d.role) == "string" then V.Role = d.role end
+	V.Role = LPL.LocalRole() -- role state comes from the banner role lists, not from the Worker reply
 	if type(d.acts) == "table" then
 		V.Acts = {}
 		local names = {}
@@ -972,7 +983,8 @@ function LPL.AttachShare(page, closeFn)
 		if s == "expired" then return '<font color="' .. YELLOW .. '">Your verification expired. Verify again below to be registered.</font>' end
 		return "Registering..."
 	end
-	local function paint() if page.Visible ~= false then local t = statusText(); if status.Text ~= t then status.Text = t end end end
+	local function roleLine() local r = V.Role; return r and ('<font color="' .. GREEN .. '">Role: ' .. (r == "co-owner" and "Co-Owner" or (r:sub(1, 1):upper() .. r:sub(2))) .. "</font>\n") or "" end
+	local function paint() if page.Visible ~= false then local t = roleLine() .. statusText(); if status.Text ~= t then status.Text = t end end end
 	Auth.Attach(page, function() return true end)
 	Pub.Hook = paint
 	Auth.Views[#Auth.Views + 1] = paint
@@ -980,15 +992,13 @@ function LPL.AttachShare(page, closeFn)
 	page:GetPropertyChangedSignal("Visible"):Connect(function() if page.Visible then paint() end end)
 end
 
+task.spawn(function() V.Role = LPL.LocalRole(true); Auth.Notify() end) -- role recognised from the banner lists at start, no manual verification
 -- automatic registration: a verified account registers this session ~10 s after the script starts (visibly, with a notice). A device that has
 -- never verified is invited once; it is only counted after it verifies, because the registry only contains authenticated script clients.
 task.delay(10, function()
 	if Auth.Load() then
 		Pub.Start()
 		notify("Live Player Log: this script session is registered in the global active-user registry (Feature Center > ACTIVE USER REGISTRY).")
-	elseif SD().LivePresenceAsked ~= true then
-		SD().LivePresenceAsked = true
-		notify("Live Player Log: verify your Roblox account in Feature Center > ACTIVE USER REGISTRY to be counted as an active script user.")
 	end
 end)
 
