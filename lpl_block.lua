@@ -10,7 +10,7 @@ local okLPL, errLPL = pcall(function()
 local Player = Players.LocalPlayer
 local TeleportService = cloneref(game:GetService("TeleportService"))
 local MarketplaceService = cloneref(game:GetService("MarketplaceService"))
-local LIVE_BACKEND = nil -- nil = the existing official Worker (Util.Guard.BACKEND). Set "https://<name>.<sub>.workers.dev" only if the repo is deployed as its own Worker.
+local LIVE_BACKEND = "https://live-player-log-system.elliptmal.workers.dev" -- the standalone Live Player Log Worker (/live/*). nil would use the old banner Worker, which has no /live routes.
 local HB_BASE, HB_JITTER = 100, 10 -- presence heartbeat (seconds), jittered. Not changed: the same heartbeat also carries commands + acknowledgements.
 local STALE_AFTER = 150 -- seconds without a heartbeat before an entry is shown as STALE (the Worker removes it at 240s)
 local PAGE_SIZE = 40 -- roster cards drawn at once (search narrows the whole global list; "Show more" draws the next page)
