@@ -453,9 +453,19 @@ local function newRow(parent, order)
 	rl.SortOrder = Enum.SortOrder.LayoutOrder
 	return r
 end
+local function copyText(txt, what)
+	if type(setclipboard) == "function" then pcall(setclipboard, txt); notify((what or "Copied") .. ".") else notify((txt:gsub("\n", "  "))) end
+end
+local function gameUrl(e)
+	if e.p <= 0 then return nil end
+	if e.j ~= "" then return "https://www.roblox.com/games/start?placeId=" .. e.p .. "&gameInstanceId=" .. e.j end
+	return "https://www.roblox.com/games/" .. e.p
+end
 local joinedAt = 0
 local function joinEntry(e)
-	if e.j == "" or e.p <= 0 then return end
+	if e.p <= 0 then return end
+	local link = gameUrl(e)
+	if e.p ~= game.PlaceId or e.j == "" then copyText(link, "Game link copied, paste it in a browser to join " .. e.n) return end -- other game / private server: the link is the way in
 	if e.j == game.JobId then notify("You are already in that server.") return end
 	if os.clock() - joinedAt < 20 then notify("A join is already in progress.") return end
 	joinedAt = os.clock()
@@ -470,16 +480,13 @@ local function joinEntry(e)
 	end
 	local okC, c = pcall(function()
 		return TeleportService.TeleportInitFailed:Connect(function(plr, result, msg)
-			if plr == Player then undo(("Could not join [%s]: %s"):format(tostring(result), tostring(msg))) end
+			if plr == Player then undo(("Could not join [%s]: %s"):format(tostring(result), tostring(msg))); copyText(link, "Game link copied instead") end
 		end)
 	end)
 	if okC then conn = c end
 	task.delay(25, function() if conn then pcall(function() conn:Disconnect() end); conn = nil end end)
 	local ok, err = pcall(function() TeleportService:TeleportToPlaceInstance(e.p, e.j, Player) end)
-	if not ok then undo("Joining is not available here (" .. tostring(err) .. "). Use COPY IDs instead.") end
-end
-local function copyText(txt, what)
-	if type(setclipboard) == "function" then pcall(setclipboard, txt); notify((what or "Copied") .. ".") else notify((txt:gsub("\n", "  "))) end
+	if not ok then undo(nil); copyText(link, "Could not teleport (" .. tostring(err) .. "), game link copied") end
 end
 local function copyIds(e)
 	copyText("UserId: " .. e.id .. "\nPlaceId: " .. e.p .. (e.j ~= "" and ("\nJobId: " .. e.j) or ""), "Copied")
@@ -511,8 +518,10 @@ function V.SendCommand(e, act)
 	end)
 end
 
+local SHORT = {kick = "KICK", kill = "KILL", deanimate = "DEAN", dizzy = "DIZZ", hallucinate = "HALL", ban = "BAN"}
 local function modButton(c, parent, act, order)
-	local b = newButton(parent, act:upper(), order, act == "ban" and Color3.fromRGB(122, 40, 44) or nil)
+	local b = newButton(parent, SHORT[act] or act:upper(), order, act == "ban" and Color3.fromRGB(122, 40, 44) or nil)
+	b.Size, b.TextSize = UDim2.new(0, 40, 1, 0), 10
 	local armed = 0
 	b.Activated:Connect(function()
 		local e = c.e
@@ -520,8 +529,8 @@ local function modButton(c, parent, act, order)
 		if act == "ban" then -- two taps: BAN removes the account from every UH backend service
 			if os.clock() - armed > 4 then
 				armed = os.clock()
-				b.Text = "CONFIRM?"
-				task.delay(4, function() if b.Parent and b.Text == "CONFIRM?" then b.Text = "BAN" end end)
+				b.Text = "SURE?"
+				task.delay(4, function() if b.Parent and b.Text == "SURE?" then b.Text = "BAN" end end)
 				return
 			end
 			armed = 0
@@ -575,6 +584,24 @@ local function makeCard(list)
 	c.avatar = av
 	c.title = headLabel(head, 14, 0)
 	c.sub = headLabel(head, 11, 21)
+	c.strip = Util.Instance("Frame", head) -- mod actions, right next to the display name
+	c.strip.BackgroundTransparency = 1
+	c.strip.AnchorPoint = Vector2.new(1, 0)
+	c.strip.Position = UDim2.new(1, 0, 0, 1)
+	c.strip.Size = UDim2.new(0, 0, 0, 18)
+	local sl = Util.Instance("UIListLayout", c.strip)
+	sl.FillDirection = Enum.FillDirection.Horizontal
+	sl.HorizontalAlignment = Enum.HorizontalAlignment.Right
+	sl.Padding = UDim.new(0, 3)
+	sl.SortOrder = Enum.SortOrder.LayoutOrder
+	c.acts = {}
+	for i, a in ipairs(ACTS) do c.acts[a] = modButton(c, c.strip, a, i) end
+	c.join = newButton(head, "JOIN", 0, Color3.fromRGB(40, 110, 70))
+	c.join.AnchorPoint = Vector2.new(1, 0)
+	c.join.Position = UDim2.new(1, 0, 0, 22)
+	c.join.Size = UDim2.new(0, 56, 0, 18)
+	c.join.TextSize = 11
+	c.join.Activated:Connect(function() if c.e then joinEntry(c.e) end end)
 	local more = Util.Instance("Frame", f)
 	more.BackgroundTransparency = 1
 	more.Size = UDim2.new(1, 0, 0, 0)
@@ -586,13 +613,11 @@ local function makeCard(list)
 	ml.SortOrder = Enum.SortOrder.LayoutOrder
 	c.more = more
 	c.info = newLabel(more, 12, 1)
-	c.rowA, c.rowB, c.rowC = newRow(more, 2), newRow(more, 3), newRow(more, 4)
-	c.join = newButton(c.rowA, "JOIN", 1)
+	c.rowA = newRow(more, 2)
+	c.link = newButton(c.rowA, "COPY LINK", 1)
 	c.copy = newButton(c.rowA, "COPY IDs", 2)
 	c.prof = newButton(c.rowA, "PROFILE", 3)
-	c.acts = {}
-	for i, a in ipairs(ACTS) do c.acts[a] = modButton(c, i <= 3 and c.rowB or c.rowC, a, i) end
-	c.join.Activated:Connect(function() if c.e then joinEntry(c.e) end end)
+	c.link.Activated:Connect(function() local l = c.e and gameUrl(c.e); if l then copyText(l, "Game link copied") end end)
 	c.copy.Activated:Connect(function() if c.e then copyIds(c.e) end end)
 	c.prof.Activated:Connect(function() if c.e then copyText(profileUrl(c.e), "Profile link copied") end end)
 	head.Activated:Connect(function()
@@ -614,8 +639,20 @@ local function paintCard(c, e, now)
 	local img = "rbxthumb://type=AvatarHeadShot&id=" .. e.id .. "&w=48&h=48" -- resolved by the Roblox engine and cached by it: no request of ours
 	if c.avatar.Image ~= img then c.avatar.Image = img end
 	local status = stale and ('<font color="' .. YELLOW .. '">STALE</font>') or ('<font color="' .. GREEN .. '">ACTIVE</font>')
-	c.title.Text = "<b>" .. esc(e.n) .. "</b>" .. ((e.d ~= "" and e.d ~= e.n) and (' <font color="' .. GRAY .. '">' .. esc(e.d) .. "</font>") or "") .. "  " .. status .. (e.ns > 1 and (" x" .. e.ns) or "")
-	c.sub.Text = '<font color="' .. GRAY .. '">' .. (e.g ~= "" and esc(e.g) or "unknown experience") .. " - " .. fmtAge(age) .. "</font>"
+	local named = e.d ~= "" and e.d ~= e.n
+	c.title.Text = "<b>" .. esc(named and e.d or e.n) .. "</b>" .. (named and (' <font color="' .. GRAY .. '">@' .. esc(e.n) .. "</font>") or "")
+	c.sub.Text = status .. (e.ns > 1 and (" x" .. e.ns) or "") .. ' <font color="' .. GRAY .. '">' .. (e.g ~= "" and esc(e.g) or "unknown experience") .. " - " .. fmtAge(age) .. "</font>"
+	local showJoin = e.p > 0 and not me
+	c.join.Visible = showJoin
+	local n = 0
+	for _, a in ipairs(ACTS) do
+		local on = V.Acts[a] == true and not me
+		c.acts[a].Visible = on
+		if on then n += 1 end
+	end
+	c.strip.Size = UDim2.new(0, math.max(0, n * 43 - 3), 0, 18)
+	c.title.Size = UDim2.new(1, -(48 + (n > 0 and (n * 43 + 1) or 0)), 0, 20)
+	c.sub.Size = UDim2.new(1, -(48 + (showJoin and 60 or 0)), 0, 20)
 	if not c.open then return end
 	c.info.Text = '<font color="' .. GRAY .. '">Username</font> ' .. esc(e.n)
 		.. '\n<font color="' .. GRAY .. '">Display</font> ' .. esc(e.d ~= "" and e.d or e.n)
@@ -625,15 +662,6 @@ local function paintCard(c, e, now)
 		.. '\n<font color="' .. GRAY .. '">PlaceId</font> ' .. e.p
 		.. '\n<font color="' .. GRAY .. '">Server</font> ' .. (canJoin and (esc(e.j:sub(1, 8)) .. "...") or "not shared / private")
 		.. '\n<font color="' .. GRAY .. '">Sessions</font> ' .. e.ns .. '\n<font color="' .. GRAY .. '">Last seen</font> ' .. fmtAge(age)
-	c.join.Visible = canJoin and not me
-	local any = {}
-	for _, a in ipairs(ACTS) do
-		local on = V.Acts[a] == true and not me
-		c.acts[a].Visible = on
-		any[a] = on
-	end
-	c.rowB.Visible = any.kick or any.kill or any.deanimate
-	c.rowC.Visible = any.dizzy or any.hallucinate or any.ban
 end
 local function overviewText(now)
 	local cnt = V.LastOk and (commas(V.Count) .. (V.Sat and "+" or "")) or "-"
