@@ -68,7 +68,7 @@ async function sha256hex(s) {
   return Array.from(new Uint8Array(d), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 function cleanText(v, max) {
-  return String(v ?? "").replace(/[\u0000-\u001f\u007f-\u009f  ]/g, "").trim().slice(0, max);
+  return String(v ?? "").replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, "").trim().slice(0, max);
 }
 function bearer(request) {
   const h = request.headers.get("Authorization") || "";
