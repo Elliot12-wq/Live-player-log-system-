@@ -11,8 +11,9 @@
 //    sessions of one account are counted once in `onlineCount`); the newest valid session is the entry's primary session and the command target.
 //  * The list is a change log: clients send a cursor ("epoch.seq") and get only what changed (or an empty "no change" answer).
 //    Every answer carries `onlineCount` (unique accounts with unexpired presence), `sessionCount`, `cap` and `sat` (capacity reached).
-//  * Presence lives in memory and is persisted only when its content changes; heartbeats never write to storage. A cold start restores NOTHING into the live
-//    registry (a persisted row has no real session / capabilities): clients re-register through the 409 resync and only then are listed and targetable.
+//  * Presence lives in memory and is snapshotted into at most SHARDS storage rows ("r:<n>"; only changed shards, at most once per FLUSH_GAP_MS; a leave writes its own
+//    shard at once), so a heartbeat never costs a write of its own. A cold start (deploy / eviction) restores every session whose last heartbeat is still inside the
+//    presence window - complete with its sid, login and capabilities - so the global count does not collapse to ~0; everything older expires exactly as it would have.
 //  * Moderation commands are structured, short-lived and addressed to one target session. They ride on the target's existing heartbeat
 //    response (no extra polling); the target acknowledges on its next presence request. Status history is stored separately from the roster.
 
@@ -37,6 +38,10 @@ const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const NAME_RE = /^[A-Za-z0-9_]{3,20}$/;
 const CID_RE = /^[0-9a-f]{32}$/;
 const SID_RE = /^[0-9a-f]{16,32}$/;
+const SHARDS = 32;                   // registry snapshot rows: the storage write volume is bounded by this, not by the number of users
+const FLUSH_GAP_MS = 45_000;         // changed shards are written at most this often
+const NAME_TTL_MS = 6 * 3600_000;    // a resolved Roblox username is reused this long (sign-ins must not depend on Roblox rate limits)
+const MAX_NAMES = 2000;
 
 const ACTIONS = new Set(["kick", "kill", "deanimate", "dizzy", "hallucinate", "ban", "unban"]);
 const ACK_STATES = new Set(["EXECUTED", "REJECTED", "FAILED", "ACTION_UNSUPPORTED"]);
@@ -102,16 +107,17 @@ export class LiveLogHub {
     this.cmds = new Map();           // commandId -> command (recent, any status)
     this.open = new Map();           // commandId -> command that is still PENDING / DELIVERED
     this.left = new Map();           // "sid:tokenHash" -> expiry; sessions that already left (blocks late full snapshots from re-creating them)
+    this.names = new Map();          // userId -> {n, d, at}: resolved Roblox names (cache)
+    this.dirty = new Set();          // registry shards changed since they were last written
+    this.flushAt = 0;
     this.hkeys = [];                 // storage keys of the moderation history, oldest first
     this.fullAt = 0;
     this.lastPurge = 0;
     this.maxPres = Math.min(20000, Math.max(100, Math.floor(Number(this.env.MAX_PRESENCE)) || DEFAULT_MAX_PRESENCE));
     const now = Date.now();
 
-    // cold start: persisted presence rows are NOT restored. A row has no real script session behind it (the live sessions - sid, login, capabilities - only
-    // existed in memory), so listing it would show an ACTIVE, actionable card that no command can reach (TARGET_OFFLINE). Genuinely active clients get 409
-    // (resync) on their next heartbeat, send their full state and register again with their real session; until then they are simply not live. Leftover rows
-    // are inert, so they are cleared here instead of lingering as ghosts.
+    // cold start: the registry is rebuilt from the "r:" shard rows (see flush / restore). Rows of the previous format ("p:") carry no real session and are cleared.
+    // Sessions whose last heartbeat is older than the presence window and banned accounts are not restored.
     const stale = [...(await this.state.storage.list({ prefix: "p:" })).keys()];
     for (let i = 0; i < stale.length; i += 100) await this.state.storage.delete(stale.slice(i, i + 100));
     const legacy = [...(await this.state.storage.list({ prefix: "c:" })).keys()]; // leftovers of the removed profile-code sign-in
@@ -127,6 +133,14 @@ export class LiveLogHub {
         else { c.st = "EXPIRED"; c.fin = now; await this.putCmd(c); }
       }
     }
+    for (const [, arr] of await this.state.storage.list({ prefix: "r:" })) { // bans are loaded above
+      if (!Array.isArray(arr)) continue;
+      for (const v of arr) {
+        const rec = this.restore(v, now);
+        if (rec && !this.bans.has(rec.u) && this.pres.size < this.maxPres) this.pres.set(rec.u, rec);
+      }
+    }
+    for (let i = 0; i < SHARDS; i++) this.dirty.add(i); // the first flush rewrites every shard without the sessions that expired meanwhile
   }
 
   async fetch(request) {
@@ -146,6 +160,8 @@ export class LiveLogHub {
     } catch (err) {
       console.error("live-log error", err && err.stack || err);
       return fail(500, "internal");
+    } finally {
+      await this.flush(Date.now()); // changed registry shards are written here (rate-limited; a storage error never fails the request)
     }
   }
 
@@ -210,13 +226,56 @@ export class LiveLogHub {
 
   removePresence(uid) {
     if (!this.pres.delete(uid)) return false;
+    this.mark(uid);
     this.tombs.push({ u: uid, rev: ++this.seq });
     while (this.tombs.length > MAX_TOMBS) this.tombFloor = this.tombs.shift().rev;
     return true;
   }
 
-  persist(rec) {
-    return this.state.storage.put("p:" + rec.u, { u: rec.u, n: rec.n, d: rec.d, pid: rec.pid, g: rec.g, j: rec.j });
+  mark(uid) { this.dirty.add(uid % SHARDS); }
+
+  /** what is stored of one account: its sessions with everything needed to keep serving them after a cold start (private server ids are never in `j`) */
+  row(rec) {
+    const ss = [];
+    for (const [k, x] of rec.ses) ss.push({ k, at: x.at, seen: x.seen, pid: x.pid, g: x.g, j: x.j, gi: x.gi, cap: [...x.cap], h: x.h });
+    return { u: rec.u, n: rec.n, d: rec.d, ss };
+  }
+
+  /** rebuilds an account from its stored row; only sessions still inside the presence window come back (older ones are what expiry would have removed anyway) */
+  restore(v, now) {
+    if (!v || !Number.isSafeInteger(v.u) || v.u < 1 || !Array.isArray(v.ss)) return null;
+    const ses = new Map();
+    for (const x of v.ss.slice(0, MAX_SCRIPT_SESSIONS)) {
+      if (!x || typeof x.k !== "string" || !SID_RE.test(x.k) || typeof x.seen !== "number" || !(now - x.seen <= PRESENCE_TTL_MS)) continue;
+      ses.set(x.k, {
+        at: Number(x.at) || x.seen, seen: x.seen, last: x.seen, pid: Number(x.pid) || 0, g: cleanText(x.g, 64),
+        j: typeof x.j === "string" && GUID_RE.test(x.j) ? x.j : "", gi: Number(x.gi) || 0,
+        cap: new Set((Array.isArray(x.cap) ? x.cap : []).filter((a) => ACTIONS.has(a))), h: typeof x.h === "string" ? x.h : "",
+      });
+    }
+    if (!ses.size) return null;
+    const rec = { u: v.u, n: cleanText(v.n, 20), d: cleanText(v.d, 32), pid: 0, g: "", j: "", seen: 0, rev: 0, crev: 0, last: now, ses, main: "", ns: 0 };
+    this.refreshMain(rec);
+    return rec;
+  }
+
+  /** writes the changed shards (all of them at most every FLUSH_GAP_MS, or just shard `only` right away). Never throws: on a storage error the shards stay dirty. */
+  async flush(now, only = -1) {
+    if (only >= 0 ? !this.dirty.has(only) : (!this.dirty.size || now - this.flushAt < FLUSH_GAP_MS)) return;
+    const idx = only >= 0 ? [only] : [...this.dirty];
+    if (only < 0) this.flushAt = now;
+    for (const i of idx) this.dirty.delete(i);
+    const rows = new Map(idx.map((i) => [i, []]));
+    for (const rec of this.pres.values()) rows.get(rec.u % SHARDS)?.push(this.row(rec));
+    const put = {}, del = [];
+    for (const [i, arr] of rows) { if (arr.length) put["r:" + i] = arr; else del.push("r:" + i); }
+    try {
+      if (Object.keys(put).length) await this.state.storage.put(put);
+      if (del.length) await this.state.storage.delete(del);
+    } catch (err) {
+      console.error("live-log flush", err && err.stack || err);
+      for (const i of idx) this.dirty.add(i);
+    }
   }
 
   /** the entry shows its NEWEST valid session; an older / stale session can never replace a newer one */
@@ -228,7 +287,7 @@ export class LiveLogHub {
     }
     rec.seen = seen;
     rec.main = main[0];
-    rec.pid = main[1].pid; rec.g = main[1].g; rec.j = main[1].j;
+    rec.pid = main[1].pid; rec.g = main[1].g; rec.j = main[1].j; rec.gi = main[1].gi;
     rec.ns = rec.ses.size;
   }
 
@@ -241,14 +300,13 @@ export class LiveLogHub {
     if (!cut) return;
     const now = Date.now();
     if (!rec.ses.size) { // last session gone: the account leaves the registry (change log + count) and its persisted row is deleted
-      if (this.removePresence(uid)) await this.state.storage.delete("p:" + uid);
+      this.removePresence(uid);
       await this.reroute(uid, now);
       return;
     }
-    const d0 = disp(rec);
     this.refreshMain(rec); // another valid session becomes the primary one
     rec.rev = rec.crev = this.touch();
-    if (disp(rec) !== d0) await this.persist(rec);
+    this.mark(uid);
     await this.reroute(uid, now);
   }
 
@@ -277,12 +335,10 @@ export class LiveLogHub {
       }
       for (const uid of gone) this.removePresence(uid);
       for (const rec of cut) {
-        const d0 = disp(rec);
         this.refreshMain(rec);
         rec.rev = rec.crev = this.touch();
-        if (disp(rec) !== d0) await this.persist(rec);
+        this.mark(rec.u);
       }
-      for (let i = 0; i < gone.length; i += 100) await this.state.storage.delete(gone.slice(i, i + 100).map((u) => "p:" + u));
       for (const [k, t] of this.left) if (t <= now) this.left.delete(k);
       for (const uid of gone) await this.reroute(uid, now); // expired sessions: their commands are re-routed or finished, never stranded
       for (const rec of cut) await this.reroute(rec.u, now);
@@ -299,27 +355,34 @@ export class LiveLogHub {
     if (this.bans.has(uid)) return fail(403, "banned");
     if (!this.hit("lig", 240, 60_000)) return fail(429, "slow");
 
-    // the username / display name come from Roblox for that user id, never from the client
-    let res;
-    try {
-      res = await fetch(`https://users.roblox.com/v1/users/${uid}`, {
-        headers: { Accept: "application/json" },
-        cf: { cacheTtl: 0, cacheEverything: false },
-      });
-    } catch {
-      return fail(503, "roblox_unavailable");
+    // the username / display name come from Roblox for that user id, never from the client. A recent lookup of the same id is reused and an older one is the
+    // fallback when Roblox cannot be reached, so registering does not hinge on Roblox rate limits.
+    const now = Date.now();
+    let who = this.names.get(uid);
+    if (!who || now - who.at > NAME_TTL_MS) {
+      let u = null;
+      for (let i = 0; i < 2 && !u; i++) {
+        if (i) await new Promise((r) => setTimeout(r, 400));
+        try {
+          const res = await fetch(`https://users.roblox.com/v1/users/${uid}`, {
+            headers: { Accept: "application/json" },
+            cf: { cacheTtl: 0, cacheEverything: false },
+          });
+          if (res.ok) u = await res.json();
+        } catch { u = null; }
+      }
+      if (u) {
+        if (typeof u !== "object" || u.id !== uid || typeof u.name !== "string" || !NAME_RE.test(u.name)) return fail(422, "account_invalid");
+        who = { n: u.name, d: cleanText(u.displayName, 32), at: now };
+        if (this.names.size >= MAX_NAMES) this.names.delete(this.names.keys().next().value);
+        this.names.set(uid, who);
+      } else if (!who) return fail(503, "roblox_unavailable");
     }
-    if (!res.ok) return fail(503, "roblox_unavailable");
-    let u;
-    try { u = await res.json(); } catch { return fail(503, "roblox_unavailable"); }
-    if (!u || u.id !== uid || typeof u.name !== "string" || !NAME_RE.test(u.name)) return fail(422, "account_invalid");
 
     // issue a session bound to the resolved user id / username (the token is shown once; only its hash is stored)
-    const now = Date.now();
     const token = randomToken();
     const h = await sha256hex(token);
-    const display = cleanText(u.displayName, 32);
-    const rec = { u: uid, n: u.name, d: display, c: now, t: now, x: now + SESSION_TTL_MS };
+    const rec = { u: uid, n: who.n, d: who.d, c: now, t: now, x: now + SESSION_TTL_MS };
     const idxKey = "ui:" + uid;
     const idx = (await this.state.storage.get(idxKey)) || [];
     idx.push(h);
@@ -330,13 +393,14 @@ export class LiveLogHub {
     }
     await this.state.storage.put({ ["s:" + h]: rec, [idxKey]: idx });
     this.sess.set(h, rec);
-    return json({ ok: true, token, uid, name: u.name, display });
+    return json({ ok: true, token, uid, name: who.n, display: who.d });
   }
 
   async authLogout(request) {
     const s = await this.session(request);
     if (!s) return fail(401, "unauthorized");
     await this.leaveSessions(s.u, (_sid, x) => x.h === s.h); // every live script session that used this login leaves the registry
+    await this.flush(Date.now(), s.u % SHARDS);
     await this.dropSession(s.h, { u: s.u });
     return json({ ok: true });
   }
@@ -364,13 +428,16 @@ export class LiveLogHub {
     if (b.t === "hb") { // heartbeat: only refreshes an existing session (a missing one asks the client to send its full state)
       if (!ses) return fail(409, "resync");
       ses.seen = ses.last = rec.seen = now;
+      ses.h = s.h; // a new sign-in of the same script run keeps its session
       rec.rev = this.touch();
+      this.mark(s.u);
       return json({ ok: true, ...(await this.deliver(s.u, sid, now)) });
     }
 
     const pid = Number.isSafeInteger(b.pid) && b.pid > 0 && b.pid < 1e14 ? b.pid : 0;
     if (!pid) return fail(400, "bad_request");
     const g = cleanText(b.g, 64);
+    const gi = Number.isSafeInteger(b.gi) && b.gi > 0 && b.gi < 1e14 ? b.gi : 0; // UniverseId of the experience (pid is the PlaceId)
     const shareJob = b.pub === true && typeof b.j === "string" && GUID_RE.test(b.j);
     const j = shareJob ? b.j.toLowerCase() : "";
     const dn = cleanText(b.dn, 32) || s.d; // display name: presentation only, never identity
@@ -387,10 +454,10 @@ export class LiveLogHub {
         for (const [k, x] of rec.ses) if (!oldest || x.seen < oldest[1].seen) oldest = [k, x];
         if (oldest) rec.ses.delete(oldest[0]);
       }
-      ses = { at: now, seen: now, last: now, pid, g, j, cap, h: s.h };
+      ses = { at: now, seen: now, last: now, pid, g, j, gi, cap, h: s.h };
       rec.ses.set(sid, ses);
     } else {
-      Object.assign(ses, { seen: now, last: now, pid, g, j, cap, h: s.h }); // `at` (session start) never moves: a late request cannot make a session "newer"
+      Object.assign(ses, { seen: now, last: now, pid, g, j, gi, cap, h: s.h }); // `at` (session start) never moves: a late request cannot make a session "newer"
     }
     rec.n = s.n; rec.d = dn;
     this.refreshMain(rec);
@@ -399,7 +466,7 @@ export class LiveLogHub {
     const contentChanged = isNew || disp(rec) !== d0;
     if (contentChanged || rec.ns !== ns0) rec.crev = rev;
     this.pres.set(s.u, rec);
-    if (contentChanged) await this.persist(rec);
+    this.mark(s.u);
     return json({ ok: true, ...(await this.deliver(s.u, sid, now)) });
   }
 
@@ -411,6 +478,7 @@ export class LiveLogHub {
     if (!this.hit("lv:" + a.s.u, 20, 60_000)) return fail(429, "slow");
     if (this.left.size < 20000) this.left.set(sid + ":" + a.s.h, Date.now() + LEFT_HOLD_MS); // set first: a request already in flight cannot re-create the session
     await this.leaveSessions(a.s.u, (id) => id === sid); // idempotent: a second leave finds nothing to remove
+    await this.flush(Date.now(), a.s.u % SHARDS);
     return json({ ok: true });
   }
 
@@ -425,7 +493,7 @@ export class LiveLogHub {
 
     let sessions = 0;
     for (const p of this.pres.values()) sessions += p.ses.size;
-    const meta = { e: this.epoch, s: this.seq, onlineCount: this.pres.size, sessionCount: sessions, cap: this.maxPres, role, acts: actionsFor(role) };
+    const meta = { e: this.epoch, s: this.seq, t: now, onlineCount: this.pres.size, sessionCount: sessions, cap: this.maxPres, role, acts: actionsFor(role) };
     if (this.pres.size >= this.maxPres || now - this.fullAt < SAT_HOLD_MS) meta.sat = 1; // the total is a lower bound, never present it as complete
 
     const [e, q] = String(url.searchParams.get("c") || "").split(".");
@@ -437,9 +505,10 @@ export class LiveLogHub {
 
     const full = since < 0 || since < this.tombFloor || since > this.seq;
     const age = (p) => Math.max(0, Math.floor((now - p.seen) / 1000));
+    const sage = (p) => { const m = p.ses.get(p.main); return m ? Math.max(0, Math.floor((now - m.at) / 1000)) : 0; }; // age of the newest session
     const up = [], tc = [], rm = [], mc = [];
     for (const p of this.pres.values()) {
-      if (full || p.crev > since) up.push({ u: p.u, n: p.n, d: p.d || undefined, p: p.pid, g: p.g, j: p.j || undefined, a: age(p), ns: p.ns > 1 ? p.ns : undefined });
+      if (full || p.crev > since) up.push({ u: p.u, n: p.n, d: p.d || undefined, p: p.pid, g: p.g, j: p.j || undefined, a: age(p), ns: p.ns > 1 ? p.ns : undefined, gi: p.gi || undefined, s: sage(p) });
       else if (p.rev > since) tc.push([p.u, age(p)]);
     }
     if (!full) for (const t of this.tombs) if (t.rev > since && !this.pres.has(t.u)) rm.push(t.u);
@@ -551,7 +620,7 @@ export class LiveLogHub {
       const ban = { u: tu, n: rec.n, by: s.u, bn: s.n, at: now, r: c.r };
       this.bans.set(tu, ban);
       await this.state.storage.put("b:" + tu, ban);
-      if (this.removePresence(tu)) await this.state.storage.delete("p:" + tu);
+      this.removePresence(tu);
       for (const o of [...this.open.values()]) if (o.tu === tu) await this.finish(o, "REJECTED", "target banned", now);
       c.st = "EXECUTED"; c.fin = now; c.note = "backend ban applied";
       await this.record(c);

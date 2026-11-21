@@ -124,6 +124,10 @@ function Auth.Forget()
 end
 function Auth.Login()
 	if Auth.Busy or Auth.Token or Auth.SignedOut then return end
+	if not guardOk() then -- authentication is the source of truth: no sign-in (so no registration) until the script's handshake succeeded
+		if not Auth.Waiting then Auth.Waiting = true; task.delay(30, function() Auth.Waiting = false; Auth.Login() end) end
+		return
+	end
 	Auth.Busy, Auth.Msg = true, nil
 	Auth.Notify()
 	task.spawn(function()
@@ -211,7 +215,7 @@ end
 local function beat(gen)
 	if Pub.Departed then return "stop" end -- this session is leaving the experience: it never registers or refreshes itself again
 	local pub = game.PrivateServerId == "" and game.JobId ~= ""
-	local snap = {pid = game.PlaceId, g = placeName():sub(1, 64), j = pub and game.JobId or "", pub = pub, sid = SID, dn = tostring(Player.DisplayName or ""):sub(1, 32), cap = caps()}
+	local snap = {pid = game.PlaceId, g = placeName():sub(1, 64), j = pub and game.JobId or "", pub = pub, sid = SID, dn = tostring(Player.DisplayName or ""):sub(1, 32), cap = caps(), gi = game.GameId}
 	local fp = snap.pid .. "|" .. snap.g .. "|" .. snap.j .. "|" .. snap.dn
 	local body = (fp == Pub.LastFP) and {t = "hb", sid = SID} or snap
 	local sent = math.min(5, #Pub.Acks)
@@ -258,7 +262,7 @@ function Pub.Start()
 				elseif r == "slow" then wait_ = HB_BASE
 				else
 					fails += 1
-					wait_ = math.min(600, 60 * 2 ^ math.min(fails, 4)) -- exponential backoff, capped at 10 minutes
+					wait_ = math.min(120, 20 * 2 ^ (math.min(fails, 4) - 1)) + math.random(0, 10) -- 20s, 40s, 80s, then about every 2 min (the Worker expires a silent session after 240s)
 					Pub.ErrText = msg
 					setPubStatus("error")
 				end
@@ -423,6 +427,7 @@ function LPL.LocalRole(refresh)
 	return nil
 end
 function V.Wipe()
+	V.SrvT = nil
 	V.Entries, V.Cursor, V.Count, V.Sessions, V.Sat, V.LastOk, V.Acts, V.ActSig, V.Role, V.Cmds = {}, nil, 0, 0, false, nil, {}, "", nil, {}
 	V.Role = LPL.LocalRole()
 	for id, c in pairs(V.Cards) do pcall(function() c.frame:Destroy() end); V.Cards[id] = nil end
@@ -687,19 +692,32 @@ local function paintCard(c, e, now)
 		.. '\n<font color="' .. GRAY .. '">PlaceId</font> ' .. e.p
 		.. '\n<font color="' .. GRAY .. '">Server</font> ' .. (canJoin and (esc(e.j:sub(1, 8)) .. "...") or "not shared / private")
 		.. '\n<font color="' .. GRAY .. '">Sessions</font> ' .. e.ns .. '\n<font color="' .. GRAY .. '">Last seen</font> ' .. fmtAge(age)
+		.. '\n<font color="' .. GRAY .. '">Session start</font> ' .. fmtAge(now - e.st)
+		.. (e.gi > 0 and ('\n<font color="' .. GRAY .. '">Universe</font> ' .. e.gi) or "")
+end
+-- live: the newest request succeeded and is recent. stale: the last good data is kept but the newest refresh failed or is overdue. unavailable: nothing was ever retrieved.
+local function dataState(now)
+	if not V.LastOk then return V.ErrText and "unavailable" or "loading" end
+	if V.ErrText or now - V.LastOk > V.Interval + 45 then return "stale" end
+	return "live"
 end
 local function overviewText(now)
-	local cnt = V.LastOk and (commas(V.Count) .. (V.Sat and "+" or "")) or "-"
+	local st = dataState(now)
 	local reg
 	if V.Halt then reg = '<font color="' .. GRAY .. '">PAUSED</font>'
-	elseif V.ErrText then reg = '<font color="' .. RED .. '">OFFLINE (retrying)</font>'
+	elseif st == "unavailable" then reg = '<font color="' .. RED .. '">UNAVAILABLE - no data yet (retrying)</font>'
+	elseif st == "stale" then reg = '<font color="' .. YELLOW .. '">STALE - showing the last successful sync' .. (V.ErrText and " (retrying)" or "") .. "</font>"
 	elseif V.Sat then reg = '<font color="' .. YELLOW .. '">SATURATED - capacity ' .. commas(V.Cap) .. " reached, the total is a lower bound</font>"
-	elseif V.LastOk then reg = '<font color="' .. GREEN .. '">LIVE</font>'
+	elseif st == "live" then reg = '<font color="' .. GREEN .. '">LIVE</font>'
 	else reg = "loading..." end
-	return "<b>GLOBAL SCRIPT USAGE</b>\nACTIVE SCRIPT USERS: <b>" .. cnt .. "</b>"
+	if V.Refreshing then reg = reg .. " - refreshing..." end
+	local known = (V.LastOk and st ~= "live") and (' <font color="' .. YELLOW .. '">(last known)</font>') or ""
+	local cnt = V.LastOk and (commas(V.Count) .. (V.Sat and "+" or "")) or "-"
+	local last = V.LastOk and (fmtAge(now - V.LastOk) .. (V.SrvT and (" (" .. os.date("!%H:%M:%S", math.floor(V.SrvT / 1000)) .. " UTC)") or "")) or "-"
+	return "<b>GLOBAL SCRIPT USAGE</b>\nACTIVE SCRIPT USERS: <b>" .. cnt .. "</b>" .. known
 		.. '\n<font color="' .. GRAY .. '">Active sessions: ' .. (V.LastOk and commas(V.Sessions) or "-")
-		.. "\nLast registry update: " .. (V.LastOk and fmtAge(now - V.LastOk) or "-")
-		.. "\nUnique accounts with presence refreshed in the last 4 minutes, all servers and experiences.</font>\nRegistry: " .. reg
+		.. "\nLast registry update: " .. last
+		.. "\nActive script users = unique accounts with a session refreshed in the last 4 minutes. Active sessions = individual script sessions. All servers and experiences.</font>\nRegistry: " .. reg
 end
 local function statusLine()
 	if V.Halt == "auth" then return '<font color="' .. YELLOW .. '">Signing in automatically. The list loads as soon as the session is ready.</font>' end
@@ -771,6 +789,7 @@ function V.Render()
 	end
 end
 local function applyMeta(d)
+	V.SrvT = tonumber(d.t) or V.SrvT -- the registry's own clock at the moment of the answer
 	if tonumber(d.onlineCount) then V.Count = math.max(0, math.floor(d.onlineCount)) end -- unique accounts, counted by the Worker
 	if tonumber(d.sessionCount) then V.Sessions = math.max(0, math.floor(d.sessionCount)) end
 	if tonumber(d.cap) then V.Cap = math.floor(d.cap) end
@@ -819,7 +838,8 @@ function V.Apply(d)
 		if id > 0 and type(u.n) == "string" then
 			local j = type(u.j) == "string" and #u.j == 36 and u.j:match("^[%x%-]+$") and u.j or ""
 			V.Entries[id] = {id = id, n = u.n:sub(1, 20), d = type(u.d) == "string" and u.d:sub(1, 32) or "", p = math.max(0, math.floor(tonumber(u.p) or 0)), g = type(u.g) == "string" and u.g:sub(1, 64) or "", j = j,
-				ns = math.max(1, math.floor(tonumber(u.ns) or 1)), seen = now - (tonumber(u.a) or 0)}
+				ns = math.max(1, math.floor(tonumber(u.ns) or 1)), seen = now - (tonumber(u.a) or 0),
+		gi = math.max(0, math.floor(tonumber(u.gi) or 0)), st = now - math.max(0, tonumber(u.s) or 0)}
 			changed = true
 		end
 	end
@@ -830,7 +850,7 @@ function V.Apply(d)
 	end
 	return changed, needFull
 end
-function V.Poll()
+local function pollBody()
 	if V.Busy then return end
 	if not LPL.CanView() then V.Wipe(); V.Halt = "gate" return end -- permission lost: drop everything cached
 	if not guardOk() then V.ErrText = "Security connection unavailable - paused."; V.NextAt = os.clock() + 30 return end
@@ -864,11 +884,12 @@ function V.Poll()
 	if ok and code == 401 then V.Wipe(); V.Halt = "auth"; Auth.Forget() return end -- token expired / revoked (Forget signs in again automatically)
 	if ok and code == 403 then V.Wipe(); V.Halt = "denied" return end -- the server says no: nothing stays cached
 	V.Fails += 1
-	local wait_ = math.min(300, 30 * 2 ^ math.min(V.Fails, 4))
+	local wait_ = math.min(300, 15 * 2 ^ math.min(V.Fails, 5))
 	V.NextAt = now + wait_
 	V.ErrText = describe(ok, code, d, err) .. " Retrying in " .. math.floor(wait_) .. "s."
 	if not V.ErrShown then V.ErrShown = true; notify("Live Player Log: connection problem. Retrying quietly in the background.") end
 end
+function V.Poll() pollBody(); V.Refreshing = false end
 function V.Kick()
 	if not V.IsOpen or V.Looping then return end
 	V.Looping = true
@@ -887,7 +908,7 @@ function V.Kick()
 end
 function V.Open()
 	if not LPL.CanView(true) then V.Wipe(); V.Halt = "gate"; return false end
-	V.IsOpen, V.Looping, V.Halt = true, false, nil
+	V.IsOpen, V.Looping, V.Halt, V.Refreshing = true, false, nil, false
 	if os.clock() - V.ClosedAt > 600 then V.Cursor = nil; V.Entries = {} end -- closed for a long time: take a fresh snapshot
 	V.Interval, V.NextAt, V.Fails, V.Shown = 30, 0, 0, PAGE_SIZE
 	V.Render()
@@ -943,6 +964,8 @@ function LPL.AttachViewer(page, closeFn)
 		if not LPL.CanView() then V.Wipe(); V.Halt = "gate"; V.Render() return end
 		V.Halt = nil
 		V.NextAt = 0
+		V.Cursor, V.Refreshing = nil, true -- ask the registry for the complete list; the numbers on screen stay until the answer arrives
+		V.Render()
 		if V.IsOpen then if V.Looping then task.spawn(function() V.Poll(); V.Render() end) else V.Kick() end end
 	end)
 	histBtn.Activated:Connect(function()
