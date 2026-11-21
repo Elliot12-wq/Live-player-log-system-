@@ -1,6 +1,7 @@
 # Standalone deployment of the Live Player Log Worker (option B in docs/DEPLOY.md).
 # If you mount the code into the existing banner Worker instead (option A), copy the two blocks marked "REQUIRED" into ITS wrangler config.
-name = "live-player-log"
+# The Worker name is its workers.dev hostname: the script calls https://live-player-log-system.elliptmal.workers.dev, so this name must stay "live-player-log-system".
+name = "live-player-log-system"
 main = "index.js"
 compatibility_date = "2024-11-01"
 
