@@ -43,7 +43,7 @@ const FLUSH_GAP_MS = 45_000;         // changed shards are written at most this 
 const NAME_TTL_MS = 6 * 3600_000;    // a resolved Roblox username is reused this long (sign-ins must not depend on Roblox rate limits)
 const MAX_NAMES = 2000;
 
-const ACTIONS = new Set(["kick", "kill", "deanimate", "dizzy", "hallucinate", "ban", "unban"]);
+const ACTIONS = new Set(["kick", "kill", "deanimate", "dizzy", "hallucinate", "silenthell", "ban", "unban"]);
 const ACK_STATES = new Set(["EXECUTED", "REJECTED", "FAILED", "ACTION_UNSUPPORTED"]);
 const UNSUPPORTED = "ACTION NOT SUPPORTED BY CURRENT CLIENT/BACKEND AUTHORITY";
 

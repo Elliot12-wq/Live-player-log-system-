@@ -16,7 +16,7 @@ const NAME_RE = /^[A-Za-z0-9_]{3,20}$/;
 /** rank used for the target check: a moderator may only act on accounts with a strictly lower rank (no role = 0) */
 export const RANK = { verified: 1, "co-owner": 2, owner: 3 };
 
-const BASE_ACTIONS = ["kick", "kill", "deanimate", "dizzy", "hallucinate"];
+const BASE_ACTIONS = ["kick", "kill", "deanimate", "dizzy", "hallucinate", "silenthell"];
 
 /** Moderation actions a role may issue. BAN (and its reversal) is owner / co-owner only. Enforced by the Worker on every command. */
 export function actionsFor(role) {

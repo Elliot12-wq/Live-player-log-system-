@@ -18,7 +18,7 @@ local PAGE_SIZE = 40 -- roster cards drawn at once (search narrows the whole glo
 local FILE = "UhhhhhhReanim/LivePlayerLog.json"
 local GREEN, YELLOW, RED, GRAY = "#6EE7A0", "#FFE066", "#FF8080", "#AAAAAA"
 local FINAL = {EXECUTED = true, REJECTED = true, EXPIRED = true, TARGET_OFFLINE = true, ACTION_UNSUPPORTED = true, FAILED = true}
-local ACTS = {"kick", "kill", "deanimate", "dizzy", "hallucinate", "ban"}
+local ACTS = {"kick", "kill", "deanimate", "dizzy", "hallucinate", "silenthell", "ban"}
 -- backend lifecycle -> what the log shows: PENDING (accepted / handed over, not finished), SUCCESS (backend confirmed execution), TIMEOUT (no answer in time), FAILED (anything else)
 local function shown(st)
 	if st == "PENDING" or st == "DELIVERED" then return "PENDING" end
@@ -216,7 +216,7 @@ local function caps()
 	if type(Util.ModActions) == "table" and type(Util.ModActions.Kill) == "function" then t[#t + 1] = "kill" end
 	if type(Util.ModDeanimate) == "function" then t[#t + 1] = "deanimate" end
 	local F = Util.ModFx
-	if type(F) == "table" and type(F.Run) == "function" then t[#t + 1] = "dizzy"; t[#t + 1] = "hallucinate" end
+	if type(F) == "table" and type(F.Run) == "function" then t[#t + 1] = "dizzy"; t[#t + 1] = "hallucinate"; t[#t + 1] = "silenthell" end
 	t[#t + 1] = "ban" -- applied by the backend; this client exits when the backend reports the ban
 	return t
 end
@@ -415,7 +415,7 @@ function Cmd.Handle(c)
 	local ttl, iat, exp = tonumber(c.ttl), tonumber(c.iat), tonumber(c.exp)
 	if not (ttl and ttl > 0 and iat and exp and exp > iat) then return bad("REJECTED", "expired or malformed") end
 	if not rank or not mu or mu < 1 or mu == Player.UserId then return bad("REJECTED", "unauthorized sender") end
-	if not (a == "kick" or a == "kill" or a == "deanimate" or a == "dizzy" or a == "hallucinate") then return bad("ACTION_UNSUPPORTED", "unknown action") end
+	if not (a == "kick" or a == "kill" or a == "deanimate" or a == "dizzy" or a == "hallucinate" or a == "silenthell") then return bad("ACTION_UNSUPPORTED", "unknown action") end
 	if rank <= myRank() then return bad("REJECTED", "target outranks sender") end
 	local have = {}
 	for _, x in ipairs(caps()) do have[x] = true end
@@ -606,7 +606,7 @@ function V.Watch()
 	end)
 end
 
-local SHORT = {kick = "KICK", kill = "KILL", deanimate = "DEAN", dizzy = "DIZZ", hallucinate = "HALL", ban = "BAN"}
+local SHORT = {kick = "KICK", kill = "KILL", deanimate = "DEAN", dizzy = "DIZZ", hallucinate = "HALL", silenthell = "HELL", ban = "BAN"}
 local function modButton(c, parent, act, order)
 	local b = newButton(parent, SHORT[act] or act:upper(), order, act == "ban" and Color3.fromRGB(122, 40, 44) or nil)
 	b.Size, b.TextSize = UDim2.new(0, 40, 1, 0), 10
@@ -1073,7 +1073,7 @@ function LPL.AttachViewer(page, closeFn)
 end
 
 -- ---------- registry page (information + status; no switch: registration is automatic while the script runs) ----------
-local EXPLAIN = "While this script runs, your session is automatically listed in the <b>global registry of active UH script users</b> and counted in the active-user total. Verified players, co-owners and the owner can see, in the Live Player Log: your <b>Roblox username, display name and UserId</b>, the <b>experience</b> you are in (name + PlaceId) and the <b>public server ID</b> of that server (they can join it). Authorized moderators can also send your script a moderation action (kick, kill, deanimate, dizzy, hallucinate) and the owner / co-owner can ban you from UH script services.\nNo IP address, device ID or other personal data is collected. Private server IDs are never shared. You can leave the registry for the current session below."
+local EXPLAIN = "While this script runs, your session is automatically listed in the <b>global registry of active UH script users</b> and counted in the active-user total. Verified players, co-owners and the owner can see, in the Live Player Log: your <b>Roblox username, display name and UserId</b>, the <b>experience</b> you are in (name + PlaceId) and the <b>public server ID</b> of that server (they can join it). Authorized moderators can also send your script a moderation action (kick, kill, deanimate, dizzy, hallucinate, Silent Hell) and the owner / co-owner can ban you from UH script services.\nNo IP address, device ID or other personal data is collected. Private server IDs are never shared. You can leave the registry for the current session below."
 function LPL.AttachShare(page, closeFn)
 	local C, L = Enum.TextXAlignment.Center, Enum.TextXAlignment.Left
 	UI.CreateButton(page, "&lt; Back", 20).Activated:Connect(closeFn)
