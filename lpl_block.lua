@@ -4,7 +4,7 @@
 -- Roles come ONLY from roles.json (owner / co-owner / verified) and whitelist.json (verified): the Worker reads them on every request. Every signed-in script client publishes its own
 -- presence (automatic; a notice and the registry page disclose exactly what is shared); only verified players / co-owners / owner can read the roster, and the Worker re-checks that on every request.
 -- The active-user count comes from the Worker (unique accounts with unexpired presence), never from a client.
--- Moderation commands arrive on the existing heartbeat response; this client validates every one and acknowledges it on the next presence request.
+-- Moderation commands reach the target through a fast short poll of GET /live/commands (same pattern as the banner system's /commands poll; the heartbeat response is only a fallback); this client validates every one and acknowledges it immediately.
 -- Everything here is client convenience: hiding UI is not the security boundary, the Worker is.
 local okLPL, errLPL = pcall(function()
 local Player = Players.LocalPlayer
@@ -12,12 +12,20 @@ local TeleportService = cloneref(game:GetService("TeleportService"))
 local MarketplaceService = cloneref(game:GetService("MarketplaceService"))
 local LIVE_BACKEND = "https://live-player-log-system.elliptmal.workers.dev" -- the standalone Live Player Log Worker (/live/*). nil would use the old banner Worker, which has no /live routes.
 local HB_BASE, HB_JITTER = 100, 10 -- presence heartbeat (seconds), jittered. Not changed: the same heartbeat also carries commands + acknowledgements.
+local CMD_POLL = 4 -- seconds between command pulls on the target (backs off to 12s on errors; the Worker expires an unanswered command after 45s)
 local STALE_AFTER = 150 -- seconds without a heartbeat before an entry is shown as STALE (the Worker removes it at 240s)
 local PAGE_SIZE = 40 -- roster cards drawn at once (search narrows the whole global list; "Show more" draws the next page)
 local FILE = "UhhhhhhReanim/LivePlayerLog.json"
 local GREEN, YELLOW, RED, GRAY = "#6EE7A0", "#FFE066", "#FF8080", "#AAAAAA"
 local FINAL = {EXECUTED = true, REJECTED = true, EXPIRED = true, TARGET_OFFLINE = true, ACTION_UNSUPPORTED = true, FAILED = true}
 local ACTS = {"kick", "kill", "deanimate", "dizzy", "hallucinate", "ban"}
+-- backend lifecycle -> what the log shows: PENDING (accepted / handed over, not finished), SUCCESS (backend confirmed execution), TIMEOUT (no answer in time), FAILED (anything else)
+local function shown(st)
+	if st == "PENDING" or st == "DELIVERED" then return "PENDING" end
+	if st == "EXECUTED" then return "SUCCESS" end
+	if st == "EXPIRED" then return "TIMEOUT" end
+	return "FAILED"
+end
 local LPL = {}
 local Fallback = {}
 local SID = (HttpService:GenerateGUID(false):gsub("-", "")):lower() -- one id per script run (several simultaneous runs of one account are counted once)
@@ -240,12 +248,34 @@ local function beat(gen)
 	if ok and code == 429 then return "slow" end
 	return "fail", describe(ok, code, d, err)
 end
+-- target side: banner-style short poll for commands addressed to this account + script session (no waiting for the ~100s heartbeat); acknowledgements leave at once via Pub.Flush
+function Cmd.StartPoll(gen)
+	task.spawn(function()
+		local fails = 0
+		while Pub.Gen == gen and Auth.Token and not Pub.Departed and not Pub.Banned do
+			local wait_ = CMD_POLL + math.random() * 1.5
+			if Pub.LastOk and guardOk() then -- only once this session is registered
+				local ok, code, d = call("GET", "/live/commands?sid=" .. SID, nil, true)
+				if Pub.Gen ~= gen then return end
+				if isBanned(ok, code, d) then LPL.OnBanned() return end
+				if ok and code == 200 and type(d) == "table" and d.ok == true then
+					fails = 0
+					if type(d.cmd) == "table" then pcall(Cmd.Receive, d.cmd) end
+				elseif ok and code == 401 then return -- the presence loop signs in again and restarts this poll
+				elseif ok and (code == 409 or code == 410) then wait_ = 10 -- session not registered / already left
+				else fails += 1; wait_ = math.min(CMD_POLL + fails * 2, 12) end
+			end
+			task.wait(wait_)
+		end
+	end)
+end
 function Pub.Start()
 	if Pub.Running or Pub.Banned or Pub.Departed or not Auth.Token then return end
 	if Pub.Left ~= nil then SID, Pub.Left = newId(), nil end -- the previous session id already left the registry: a (re)join is a brand-new session
 	Pub.Running = true
 	Pub.Gen += 1
 	local gen = Pub.Gen
+	Cmd.StartPoll(gen)
 	setPubStatus("starting")
 	task.spawn(function()
 		local fails = 0
@@ -523,8 +553,9 @@ function V.SendCommand(e, act)
 		if ok and code == 200 and type(d) == "table" and d.ok == true and type(d.id) == "string" then
 			local st = tostring(d.st)
 			V.Cmds[d.id] = {st = st, a = act, tn = e.n, note = tostring(d.note or ""), t = os.clock(), noted = FINAL[st] == true}
-			notify(label .. ": " .. st .. (st == "PENDING" and " (waiting for the target's next heartbeat)" or ""))
+			notify(label .. ": " .. shown(st) .. (V.Cmds[d.id].note ~= "" and (" (" .. V.Cmds[d.id].note .. ")") or ""))
 			V.Interval, V.NextAt = 20, os.clock() + 20
+			if not FINAL[st] then V.Watch() end
 		elseif isBanned(ok, code, d) then LPL.OnBanned()
 		elseif ok and code == 401 then Auth.Forget(); V.Halt = "auth"
 		elseif ok and type(d) == "table" and (d.err == "target_offline" or d.st == "TARGET_OFFLINE") then
@@ -539,12 +570,38 @@ function V.SendCommand(e, act)
 			V.Cursor, V.Halt, V.NextAt = nil, nil, 0 -- the old cursor cannot be trusted: full snapshot now (the poll loop retries if one is still running)
 			V.Poll()
 		elseif ok and type(d) == "table" then
+			if type(d.id) == "string" and type(d.st) == "string" and V.Cmds[d.id] == nil then -- rejected / failed by the backend (or an already open duplicate): show its real status
+				V.Cmds[d.id] = {st = d.st, a = act, tn = e.n, note = tostring(d.note or ""), t = os.clock(), noted = FINAL[d.st] == true}
+				if not FINAL[d.st] then V.Watch() end
+			end
 			if d.msg then notify(label .. ": " .. tostring(d.msg))
-			else notify(label .. ": " .. tostring(d.st or d.err or ("HTTP " .. code))) end
+			elseif d.st then notify(label .. ": " .. shown(tostring(d.st)))
+			else notify(label .. ": FAILED (" .. tostring(d.err or ("HTTP " .. code)) .. ")") end
+		elseif not ok then -- the backend did not answer within the request timeout
+			V.Cmds["local" .. newId()] = {st = "EXPIRED", a = act, tn = e.n, note = "backend did not respond", t = os.clock(), noted = true}
+			notify(label .. ": TIMEOUT (" .. describe(ok, code, d, err) .. ")")
 		else
-			notify(label .. ": " .. describe(ok, code, d, err))
+			notify(label .. ": FAILED (" .. describe(ok, code, d, err) .. ")")
 		end
 		V.Render()
+	end)
+end
+-- while one of my commands is still open: ask the backend for its status every 3s (instead of the slow roster loop); anything still unanswered after ~50s shows TIMEOUT
+function V.Watch()
+	if V.Watching then return end
+	V.Watching = true
+	task.spawn(function()
+		local t0 = os.clock()
+		while V.IsOpen and V.OpenCmds() and os.clock() - t0 < 55 do
+			task.wait(3)
+			if not V.IsOpen then break end
+			V.Poll(); V.Render()
+		end
+		for _, x in pairs(V.Cmds) do
+			if not FINAL[x.st] and os.clock() - x.t >= 50 then x.st, x.note, x.noted = "EXPIRED", "no response in time", true end
+		end
+		V.Watching = false
+		if V.IsOpen then V.Render() end
 	end)
 end
 
@@ -734,7 +791,7 @@ local function cmdLines()
 	for i = 1, math.min(5, #arr) do
 		local x = arr[i]
 		local col = x.st == "EXECUTED" and GREEN or ((x.st == "PENDING" or x.st == "DELIVERED") and YELLOW or RED)
-		out[#out + 1] = "<b>" .. esc(x.a:upper()) .. "</b> " .. esc(x.tn) .. ': <font color="' .. col .. '">' .. esc(x.st) .. "</font>" .. (x.note ~= "" and (' <font color="' .. GRAY .. '">' .. esc(x.note) .. "</font>") or "")
+		out[#out + 1] = "<b>" .. esc(x.a:upper()) .. "</b> " .. esc(x.tn) .. ': <font color="' .. col .. '">' .. esc(shown(x.st)) .. "</font>" .. (x.note ~= "" and (' <font color="' .. GRAY .. '">' .. esc(x.note) .. "</font>") or "")
 	end
 	return table.concat(out, "\n")
 end
@@ -813,7 +870,7 @@ local function applyMeta(d)
 				if isNew then x.noted = FINAL[st] == true
 				elseif FINAL[st] and not x.noted then
 					x.noted = true
-					notify(x.a:upper() .. " on " .. x.tn .. ": " .. st .. (x.note ~= "" and (" (" .. x.note .. ")") or ""))
+					notify(x.a:upper() .. " on " .. x.tn .. ": " .. shown(st) .. (x.note ~= "" and (" (" .. x.note .. ")") or ""))
 				end
 			end
 		end

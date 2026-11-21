@@ -14,8 +14,8 @@
 //  * Presence lives in memory and is snapshotted into at most SHARDS storage rows ("r:<n>"; only changed shards, at most once per FLUSH_GAP_MS; a leave writes its own
 //    shard at once), so a heartbeat never costs a write of its own. A cold start (deploy / eviction) restores every session whose last heartbeat is still inside the
 //    presence window - complete with its sid, login and capabilities - so the global count does not collapse to ~0; everything older expires exactly as it would have.
-//  * Moderation commands are structured, short-lived and addressed to one target session. They ride on the target's existing heartbeat
-//    response (no extra polling); the target acknowledges on its next presence request. Status history is stored separately from the roster.
+//  * Moderation commands are structured, short-lived and addressed to one target session. The target pulls them from GET /live/commands (the same short-poll
+//    pattern as the banner system's /commands, a few seconds apart) and the heartbeat response still carries them as a fallback; the target acknowledges at once. Status history is stored separately from the roster.
 
 import { loadRoleTable, roleFor, actionsFor, RANK } from "./roles.js";
 
@@ -28,8 +28,8 @@ const MAX_SESSIONS_PER_USER = 5;     // stored login tokens per account
 const MAX_SCRIPT_SESSIONS = 5;       // simultaneous live script sessions per account
 const MIN_PRESENCE_GAP_MS = 15_000;
 const MAX_BODY = 2048;
-const CMD_TTL_MS = 300_000;          // a command must reach the target within 5 minutes (its next heartbeat) or it expires
-const REDELIVER_MS = 90_000;         // a delivered but unacknowledged command is offered again after this long (the client dedupes by id)
+const CMD_TTL_MS = 45_000;           // a command must reach AND be acknowledged by the target within 45 s (fast /live/commands pull) or it finishes as EXPIRED (shown as TIMEOUT)
+const REDELIVER_MS = 10_000;         // a delivered but unacknowledged command is offered again after this long (the client dedupes by id)
 const CMD_KEEP_MS = 900_000;         // finished commands stay in memory this long so the moderator sees the final status
 const MAX_HIST = 300;                // moderation history entries kept in storage
 const LEFT_HOLD_MS = 600_000;        // a session that sent /live/presence/leave cannot be re-registered by a late / reordered request for this long
@@ -153,6 +153,7 @@ export class LiveLogHub {
         case "POST /live/presence": return await this.presence(request);
         case "POST /live/presence/leave": return await this.leave(request);
         case "GET /live/list": return await this.list(request, url);
+        case "GET /live/commands": return await this.commands(request, url);
         case "POST /live/mod/command": return await this.command(request);
         case "GET /live/mod/history": return await this.history(request);
         default: return fail(404, "not_found");
@@ -563,6 +564,23 @@ export class LiveLogHub {
       out.push({ id: c.id, tu: c.tu, ts: c.ts, mu: c.mu, mn: c.mn, mr: c.mr, a: c.a, iat: c.iat, exp: c.exp, ttl: c.exp - now, r: c.r || undefined, d: c.d || undefined });
     }
     return out.length ? { cmd: out } : {};
+  }
+
+  /** target side, banner-style short poll: only commands addressed to THIS account AND this script session are handed over (same deliver() as the heartbeat) */
+  async commands(request, url) {
+    const a = await this.need(request);
+    if (a.res) return a.res;
+    const s = a.s;
+    if (!this.hit("cp:" + s.u, 90, 60_000)) return fail(429, "slow");
+    const sid = (url.searchParams.get("sid") || "").toLowerCase();
+    if (!SID_RE.test(sid)) return fail(400, "bad_request");
+    const now = Date.now();
+    if ((this.left.get(sid + ":" + s.h) || 0) > now) return fail(410, "left");
+    await this.purge(now); // rate-limited inside: unanswered commands finish as EXPIRED on time
+    const rec = this.pres.get(s.u);
+    if (!rec || !rec.ses.has(sid)) return fail(409, "resync");
+    if (!this.open.size) return json({ ok: true });
+    return json({ ok: true, ...(await this.deliver(s.u, sid, now)) });
   }
 
   /** acknowledgements from the target client; only the addressed session may answer for its command */

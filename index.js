@@ -21,6 +21,7 @@ const ROUTES = {
   "POST /live/presence": true,
   "POST /live/presence/leave": true,
   "GET /live/list": true,
+  "GET /live/commands": true,
   "POST /live/mod/command": true,
   "GET /live/mod/history": true,
 };
