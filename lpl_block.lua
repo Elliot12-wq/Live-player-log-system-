@@ -12,7 +12,7 @@ local TeleportService = cloneref(game:GetService("TeleportService"))
 local MarketplaceService = cloneref(game:GetService("MarketplaceService"))
 local LIVE_BACKEND = "https://live-player-log-system.elliptmal.workers.dev" -- the standalone Live Player Log Worker (/live/*). nil would use the old banner Worker, which has no /live routes.
 local HB_BASE, HB_JITTER = 100, 10 -- presence heartbeat (seconds), jittered. Not changed: the same heartbeat also carries commands + acknowledgements.
-local CMD_POLL = 4 -- seconds between command pulls on the target (backs off to 12s on errors; the Worker expires an unanswered command after 45s)
+local CMD_POLL = 2 -- seconds between command pulls on the target (same cadence as the banner system's /commands poll; backs off to 12s on errors; the Worker expires an unanswered command after 45s)
 local STALE_AFTER = 150 -- seconds without a heartbeat before an entry is shown as STALE (the Worker removes it at 240s)
 local PAGE_SIZE = 40 -- roster cards drawn at once (search narrows the whole global list; "Show more" draws the next page)
 local FILE = "UhhhhhhReanim/LivePlayerLog.json"
@@ -253,7 +253,7 @@ function Cmd.StartPoll(gen)
 	task.spawn(function()
 		local fails = 0
 		while Pub.Gen == gen and Auth.Token and not Pub.Departed and not Pub.Banned do
-			local wait_ = CMD_POLL + math.random() * 1.5
+			local wait_ = CMD_POLL + math.random() * 0.5
 			if Pub.LastOk and guardOk() then -- only once this session is registered
 				local ok, code, d = call("GET", "/live/commands?sid=" .. SID, nil, true)
 				if Pub.Gen ~= gen then return end
@@ -263,6 +263,7 @@ function Cmd.StartPoll(gen)
 					if type(d.cmd) == "table" then pcall(Cmd.Receive, d.cmd) end
 				elseif ok and code == 401 then return -- the presence loop signs in again and restarts this poll
 				elseif ok and (code == 409 or code == 410) then wait_ = 10 -- session not registered / already left
+				elseif ok and code == 404 then wait_ = 60 -- Worker without /live/commands: the heartbeat still carries commands
 				else fails += 1; wait_ = math.min(CMD_POLL + fails * 2, 12) end
 			end
 			task.wait(wait_)

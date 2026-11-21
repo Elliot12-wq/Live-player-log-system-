@@ -571,7 +571,7 @@ export class LiveLogHub {
     const a = await this.need(request);
     if (a.res) return a.res;
     const s = a.s;
-    if (!this.hit("cp:" + s.u, 90, 60_000)) return fail(429, "slow");
+    if (!this.hit("cp:" + s.u, 200, 60_000)) return fail(429, "slow");
     const sid = (url.searchParams.get("sid") || "").toLowerCase();
     if (!SID_RE.test(sid)) return fail(400, "bad_request");
     const now = Date.now();
