@@ -43,7 +43,7 @@ const FLUSH_GAP_MS = 45_000;         // changed shards are written at most this 
 const NAME_TTL_MS = 6 * 3600_000;    // a resolved Roblox username is reused this long (sign-ins must not depend on Roblox rate limits)
 const MAX_NAMES = 2000;
 
-const ACTIONS = new Set(["kick", "kill", "deanimate", "dizzy", "hallucinate", "silenthell", "ban", "unban"]);
+const ACTIONS = new Set(["kick", "kill", "deanimate", "dizzy", "hallucinate", "silenthell", "domain", "cooked", "dropbomb", "ban", "unban"]);
 const ACK_STATES = new Set(["EXECUTED", "REJECTED", "FAILED", "ACTION_UNSUPPORTED"]);
 const UNSUPPORTED = "ACTION NOT SUPPORTED BY CURRENT CLIENT/BACKEND AUTHORITY";
 
@@ -442,7 +442,7 @@ export class LiveLogHub {
     const shareJob = b.pub === true && typeof b.j === "string" && GUID_RE.test(b.j);
     const j = shareJob ? b.j.toLowerCase() : "";
     const dn = cleanText(b.dn, 32) || s.d; // display name: presentation only, never identity
-    const cap = new Set((Array.isArray(b.cap) ? b.cap.slice(0, 8) : []).filter((x) => typeof x === "string" && ACTIONS.has(x)));
+    const cap = new Set((Array.isArray(b.cap) ? b.cap.slice(0, 16) : []).filter((x) => typeof x === "string" && ACTIONS.has(x)));
     if (!rec && this.pres.size >= this.maxPres) { this.fullAt = now; return fail(503, "full"); }
 
     const isNew = !rec;
