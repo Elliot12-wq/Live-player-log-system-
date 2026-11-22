@@ -18,7 +18,7 @@ local PAGE_SIZE = 40 -- roster cards drawn at once (search narrows the whole glo
 local FILE = "UhhhhhhReanim/LivePlayerLog.json"
 local GREEN, YELLOW, RED, GRAY = "#6EE7A0", "#FFE066", "#FF8080", "#AAAAAA"
 local FINAL = {EXECUTED = true, REJECTED = true, EXPIRED = true, TARGET_OFFLINE = true, ACTION_UNSUPPORTED = true, FAILED = true}
-local ACTS = {"kick", "kill", "deanimate", "dizzy", "hallucinate", "silenthell", "ban"}
+local ACTS = {"kick", "kill", "deanimate", "dizzy", "hallucinate", "silenthell", "domain", "cooked", "dropbomb", "ban"}
 -- backend lifecycle -> what the log shows: PENDING (accepted / handed over, not finished), SUCCESS (backend confirmed execution), TIMEOUT (no answer in time), FAILED (anything else)
 local function shown(st)
 	if st == "PENDING" or st == "DELIVERED" then return "PENDING" end
@@ -217,6 +217,12 @@ local function caps()
 	if type(Util.ModDeanimate) == "function" then t[#t + 1] = "deanimate" end
 	local F = Util.ModFx
 	if type(F) == "table" and type(F.Run) == "function" then t[#t + 1] = "dizzy"; t[#t + 1] = "hallucinate"; t[#t + 1] = "silenthell" end
+	if type(F) == "table" and type(F.Run) == "function" and type(F.Handles) == "function" then
+		for _, x in ipairs({"domain", "cooked", "dropbomb"}) do
+			local okh, h = pcall(F.Handles, x)
+			if okh and h == true then t[#t + 1] = x end
+		end
+	end
 	t[#t + 1] = "ban" -- applied by the backend; this client exits when the backend reports the ban
 	return t
 end
@@ -415,7 +421,7 @@ function Cmd.Handle(c)
 	local ttl, iat, exp = tonumber(c.ttl), tonumber(c.iat), tonumber(c.exp)
 	if not (ttl and ttl > 0 and iat and exp and exp > iat) then return bad("REJECTED", "expired or malformed") end
 	if not rank or not mu or mu < 1 or mu == Player.UserId then return bad("REJECTED", "unauthorized sender") end
-	if not (a == "kick" or a == "kill" or a == "deanimate" or a == "dizzy" or a == "hallucinate" or a == "silenthell") then return bad("ACTION_UNSUPPORTED", "unknown action") end
+	if not (a == "kick" or a == "kill" or a == "deanimate" or a == "dizzy" or a == "hallucinate" or a == "silenthell" or a == "domain" or a == "cooked" or a == "dropbomb") then return bad("ACTION_UNSUPPORTED", "unknown action") end
 	if rank <= myRank() then return bad("REJECTED", "target outranks sender") end
 	local have = {}
 	for _, x in ipairs(caps()) do have[x] = true end
@@ -606,7 +612,7 @@ function V.Watch()
 	end)
 end
 
-local SHORT = {kick = "KICK", kill = "KILL", deanimate = "DEAN", dizzy = "DIZZ", hallucinate = "HALL", silenthell = "HELL", ban = "BAN"}
+local SHORT = {kick = "KICK", kill = "KILL", deanimate = "DEAN", dizzy = "DIZZ", hallucinate = "HALL", silenthell = "HELL", domain = "DOM", cooked = "COOK", dropbomb = "BOMB", ban = "BAN"}
 local function modButton(c, parent, act, order)
 	local b = newButton(parent, SHORT[act] or act:upper(), order, act == "ban" and Color3.fromRGB(122, 40, 44) or nil)
 	b.Size, b.TextSize = UDim2.new(0, 40, 1, 0), 10
